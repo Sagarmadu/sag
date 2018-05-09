@@ -1,0 +1,124 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  vars:
+      ansible_ssh_user: "{{ jsonData.deploy.user }}"
+      ansible_ssh_pass: "{{ jsonData.deploy.password | b64decode }}"
+
+  tasks:
+    - include: tasks/init.yml
+
+- name: Install Packages
+  hosts: esx
+  become: false
+  gather_facts: no
+
+  tasks:
+    - set_fact:
+        buildUrl: "{{ options.build | default(buildInfo.build, True) }}"
+
+    - name: Get Datastore name
+      shell: ls -1d /vmfs/volumes/snap* | awk -F/ '{print $4'}
+      register: ds_name
+
+    - name: Install VIBs
+      shell: wget -P /vmfs/volumes/{{ ds_name.stdout }} {{ buildUrl}}/package/springpath-bundle.zip; esxcli software vib install -d /vmfs/volumes/{{ ds_name.stdout }}/springpath-bundle.zip -f; rm -f /vmfs/volumes/{{ ds_name.stdout }}/springpath-bundle.zip
+      failed_when: False
+      register: installvibout
+
+
+- name: Install Packages
+  hosts: controllers
+  become: false
+  gather_facts: no
+
+  tasks:
+
+    - set_fact:
+        node_ips: "{{ groups['esx'] | join(' ') }}"
+        vm_name: "stCtlVM-{{ inventory_hostname }}"
+        storfsRelease: "{{ hostvars[inventory_hostname]['storfsRelease'] }}"
+        storfsBuild: "{{ hostvars[inventory_hostname]['storfsBuild'] }}"
+        package: "{{ hostvars[inventory_hostname]['package'] }}"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) }}"
+
+    - debug:
+        msg: "Release: {{ storfsRelease }} Build: {{ storfsBuild }}"
+
+    - name: Extract storfs-packages
+      unarchive:
+        src: "{{ buildUrl }}/{{ package }}"
+        dest: /tmp
+        remote_src: True
+        exclude:
+          - "stCtlVM.ova"
+
+    - name: Extract storfs-support-internal
+      unarchive:
+        src: "{{ buildUrl }}/storfs-support-internal-{{storfsRelease}}-{{storfsBuild}}.tgz"
+        dest: /tmp
+        remote_src: True
+
+    - name: Installing spbash OSS Package on Storage Controller VM
+      shell: cat /tmp/storfs-oss-packages.list | grep "spbash" | xargs -I{} dpkg -i --force-confold /tmp/{}
+
+    - name: Installing Software Packages on Storage Controller VM
+      shell: /tmp/inst-packages.sh; /tmp/inst-support-internal.sh
+      async: 1800
+      poll: 60
+
+    - name: Disable pppd service
+      shell: rm /etc/init/ttyS0.conf; rm /etc/init/sedsvc.conf
+      when: storfsRelease | version_compare('2.5.1a', '>=')
+      ignore_errors: true
+
+    - block:
+        - name: Enable all flash
+          lineinfile: dest=/opt/springpath/storfs-core/sdpmemcfg.py
+                    regexp='media_type = "HDD" if media == 1 else "SSD"'
+                    line='                media_type = "SSD"'
+        - shell: rm /opt/springpath/config/sdphardware.json
+      when: allFlash == true
+
+    - name: Copy lshw.sh to fake disk slot mapping
+      copy:
+        src: "{{ item }}"
+        dest: /usr/share/springpath/storfs-misc/
+        mode: 0500
+      with_items:
+        - files/lshw.sh
+        - files/disk-getinfo.sh
+
+    - name:  Cleanup diskmap files
+      shell: rm -f /var/log/springpath/diskslotmap-*; rm -f /var/log/springpath/lshw-full.*; rm /var/log/springpath/generic-disk-info.txt
+      ignore_errors: true
+
+    - name: Reboot Controller VM
+      shell: reboot
+
+    - name: Waiting for Controller to Restart
+      local_action:
+         module: wait_for
+             host={{ inventory_hostname }}
+             port=22
+             state=started
+             delay=30
+             timeout=1800
+
+    - name: Validating Cluster Services Available
+      command: echo srvr | nc localhost 2181
+      register: ret
+      until: ret.rc == 0
+      retries: 15
+      delay: 20
+
+    - name: Validating Software Services
+      command: stcli about
+      register: ret
+      until: ret.rc == 0
+      retries: 4
+      delay: 20

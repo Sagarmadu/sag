@@ -1,0 +1,138 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    ansible_ssh_user: "{{ jsonData.deploy.user }}"
+    ansible_ssh_pass: "{{ jsonData.deploy.password | b64decode }}"
+
+  tasks:
+    - include: tasks/init.yml
+
+- name: Deploy ESX Template
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        vm_name: "{{ jsonData.deploy.vmPrefix }}-{{ userId }}-{{ hostvars[inventory_hostname]['clusterName'] }}-{{ inventory_hostname }}"
+        cvm_name: "stCtlVM-{{ userId }}-{{ inventory_hostname }}"
+        template_name: "{{ jsonData.deploy.vcCluster }}-{{ template_map[buildInfo.esx].split('/')[4] }}"
+        cvm_template: "{{ jsonData.deploy.vcCluster }}-{{ template_map[buildInfo.scvm].split('/')[4] }}-controller"
+        storfsRelease: "{{ hostvars[inventory_hostname]['storfsRelease'] }}"
+        storfsBuild: "{{ hostvars[inventory_hostname]['storfsBuild'] }}"
+        replRoleType: "{{ cluster.replRoleType | default(omit) }}"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) | regex_replace('latest', storfsBuild) }}"
+
+    - name: Waiting for ESXi Host To Start
+      local_action:
+         module: wait_for
+             host={{ inventory_hostname }}
+             port=22
+             state=started
+             delay=10
+             timeout=1800
+
+    - name: Waiting for ESXi System Services To Be Ready
+      shell: esxcli system uuid get
+      register: systemUuid
+      until: systemUuid.rc == 0
+      retries: 50
+      delay: 10
+
+    - name: Enable vMotion
+      shell: vim-cmd hostsvc/vmotion/vnic_set vmk1
+
+
+- name: Run Upgrade
+  hosts: clusters
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+    - set_fact:
+        node_ips: "{{ groups['esx'] | join(' ') }}"
+        vm_name: "stCtlVM-{{ inventory_hostname }}"
+        storfsRelease: "{{ hostvars[inventory_hostname]['storfsRelease'] }}"
+        storfsBuild: "{{ hostvars[inventory_hostname]['storfsBuild'] }}"
+        package: "{{ hostvars[inventory_hostname]['package'] }}"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) | regex_replace('latest', storfsBuild) }}"
+
+    - name: Waiting for Controller to Restart
+      local_action:
+         module: wait_for
+             host={{ inventory_hostname }}
+             port=22
+             state=started
+             delay=10
+             timeout=3600
+
+    - debug:
+        msg: "Build: {{ buildUrl }} Build: {{ storfsBuild }}"
+
+    - name: Get eth0 IP Address
+      shell: cat /etc/network/eth0.interface  | grep address | awk '{print $NF}'
+      register: eth0Ip
+
+
+    - name: Download package
+      get_url:
+        url: "{{ buildUrl }}/{{ package }}"
+        dest: /tmp
+      register: ret
+      until: ret | success
+      retries: 5
+      delay: 60
+      delegate_to: "{{ eth0Ip.stdout }}"
+
+    - name: Waiting for cluster to be healthy
+      shell: stcli cluster storage-summary
+      register: stcli_storage_summary
+      retries: 60
+      delay: 60
+      until: "stcli_storage_summary.stdout.find('dataReplicationCompliance: compliant') != -1"
+      ignore_errors: true
+      delegate_to: "{{ eth0Ip.stdout }}"
+
+    - name: Extract package
+      unarchive:
+        src: "/tmp/{{ package }}"
+        dest: /tmp
+        copy: no
+      register: ret
+      until: ret | success
+      retries: 5
+      delay: 10
+      delegate_to: "{{ eth0Ip.stdout }}"
+
+    - name: Cluster Bootstrap
+      raw: cd /tmp && ./cluster-bootstrap.sh -n
+      delegate_to: "{{ eth0Ip.stdout }}"
+
+    - name: Start Cluster Upgrade
+      shell: nohup stcli cluster upgrade --location /tmp/{{ package }} --accept-eula --vcenter-user {{ jsonData.vcenter.user }} --vcenter-password '{{ jsonData.vcenter.password }}' --components hxdp > /dev/null &
+      async: 0
+      poll: 0
+      delegate_to: "{{ eth0Ip.stdout }}"
+
+    - pause:
+        minutes: 20
+
+    - name: Wait for upgrade to finish
+      shell: stcli cluster upgrade --status
+      retries: 50
+      delay: 300
+      register: upgrade_result
+      until: upgrade_result.stdout.find("Cluster upgrade succeeded") != -1 or upgrade_result.stdout.find("Cluster upgrade failed") != -1
+
+    - fail:
+        msg: "Upgrade failed"
+      when: upgrade_result.stdout.find("Cluster upgrade failed") != -1

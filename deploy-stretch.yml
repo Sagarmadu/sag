@@ -1,0 +1,210 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    ansible_ssh_user: "{{ jsonData.deploy.user }}"
+    ansible_ssh_pass: "{{ jsonData.deploy.password | b64decode }}"
+
+  tasks:
+    - include: tasks/init.yml
+
+- name: Deploy ESX Template
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+    - include: tasks/esx.yml
+
+- name: Install Packages
+  hosts: controllers
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+    - include: tasks/install.yml
+
+- name: Create Cluster
+  hosts: clusters
+  become: false
+  gather_facts: no
+  serial: 1
+
+  tasks:
+
+    - set_fact:
+        node_ips: []
+        cvm_ips: []
+        repl_ips: []
+        siteA: []
+        siteB: []
+        replRoleType: "{{ cluster.replRoleType | default(omit, True) }}"
+        esxUsername: "--esx-username {{ jsonData.esx.user }} --esx-password {{ jsonData.esx.password | b64decode }}"
+
+    - set_fact:
+        node_ips: "{{ node_ips }} + [ '{{ hostvars[item].esx_host }}' ]"
+        cvm_ips: "{{ cvm_ips }} + [ '{{ hostvars[item].scvmip }}' ]"
+      with_items: "{{ groups['controllers'] }}"
+      when: hostvars[item].mgmtcip == inventory_hostname
+
+    - set_fact:
+        repl_ips: "{{ repl_ips }} + [ '{{ hostvars[item].replip }}' ]"
+      with_items: "{{ groups['controllers'] }}"
+      when: hostvars[item].mgmtcip == inventory_hostname and replRoleType is defined
+
+    - set_fact:
+        repl_ips: "{{ repl_ips }} + [ '{{ hostvars[item].replcip }}' ]"
+      with_items: "{{ groups['controllers'] }}"
+      when: replRoleType is defined
+
+    - set_fact:
+        node_ips: "{{ node_ips | sort }}"
+        nodeIndex: "{{ ((node_ips | length) / 2)  | int }}"
+
+
+    - name: Create VC datacenter
+      local_action:
+        module: vmware_datacenter
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ hostvars[inventory_hostname]['datacenter'] }}"
+        state: present
+        validate_certs: false
+
+    - name: Remove VC cluster
+      local_action:
+        module: vmware_cluster
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ hostvars[inventory_hostname]['datacenter'] }}"
+        cluster_name: "{{ hostvars[inventory_hostname]['clusterName'] }}"
+        state: absent
+        validate_certs: false
+
+    - name: Clean VC Extensions
+      local_action: script library/cleanVcExtensions.py --username {{ jsonData.vcenter.user }} --password {{ jsonData.vcenter.password }} {{ hostvars[inventory_hostname]['vcsaIp'] }}
+
+    - name: Create VC cluster
+      local_action:
+        module: vmware_cluster
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ hostvars[inventory_hostname]['datacenter'] }}"
+        cluster_name: "{{ hostvars[inventory_hostname]['clusterName'] }}"
+        state: present
+        validate_certs: false
+
+    - name: Add host to VC
+      local_action:
+        module: vmware_host
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ hostvars[inventory_hostname]['datacenter'] }}"
+        cluster_name: "{{ hostvars[inventory_hostname]['clusterName'] }}"
+        esxi_hostname: "{{ item }}"
+        esxi_username: "{{ jsonData.esx.user }}"
+        esxi_password: "{{ jsonData.esx.password | b64decode }}"
+        state: present
+        validate_certs: false
+      with_items: "{{ node_ips }}"
+      register: ret
+      async: 7200
+      poll: 0
+      until: ret | success
+
+    - name: Wait for hosts to be added
+      async_status: jid={{ item.ansible_job_id }}
+      register: host_jobs
+      until: host_jobs.finished
+      retries: 10
+      with_items: "{{ ret.results }}"
+      ignore_errors: true
+      delegate_to: localhost
+
+    - set_fact:
+        siteA: "{{ siteA }} + [ '{{ item }}:SiteA' ]"
+      with_items: "{{ node_ips[:nodeIndex|int] }}"
+
+    - set_fact:
+        siteB: "{{ siteB }} + [ '{{ item }}:SiteB' ]"
+      with_items: "{{ node_ips[nodeIndex|int:] }}"
+
+    - debug:
+        msg: stcli cluster create --name {{ hostvars[inventory_hostname]['clusterName'] }}  --ip {{ hostvars[inventory_hostname]['datacip'] }} --mgmt-ip {{ hostvars[inventory_hostname]['mgmtcip'] }} --vcenter-datacenter {{ hostvars[inventory_hostname]['datacenter'] }}  --vcenter-cluster {{ hostvars[inventory_hostname]['clusterName'] }}  --vcenter-url {{ hostvars[inventory_hostname]['vcsaIp'] }} --vcenter-password '{{ jsonData.vcenter.password }}' --controller-root-password {{ jsonData.esx.password | b64decode }} --data-replication-factor {{ cluster.replicationFactor }} --node-ips {{ siteA | join(' ') }} {{ siteB | join(' ') }} {{ esxUsername if storfsRelease | version_compare('1.8.1a', '>=') else '' }} --accept-eula --vcenter-user {{ jsonData.vcenter.user }} --zone 2 --numzones 2 --clusterType 1 --data-zk-ip {{ hostvars[inventory_hostname]['witnessIp'] }} -f
+
+    - debug:
+        msg:
+          - "ESX: {{ node_ips | join(', ') }}"
+          - "Controllers: {{ cvm_ips | join(', ') }}"
+          - "Repl IPs: {{ repl_ips | unique | join(', ') }}"
+          - "vCenter: {{ hostvars[inventory_hostname]['vcsaIp'] }}"
+          - "Witness: {{ hostvars[inventory_hostname]['witnessIp'] }}"
+
+    - name: Create cluster
+      shell: stcli cluster create --name {{ hostvars[inventory_hostname]['clusterName'] }}  --ip {{ hostvars[inventory_hostname]['datacip'] }} --mgmt-ip {{ hostvars[inventory_hostname]['mgmtcip'] }} --vcenter-datacenter {{ hostvars[inventory_hostname]['datacenter'] }}  --vcenter-cluster {{ hostvars[inventory_hostname]['clusterName'] }}  --vcenter-url {{ hostvars[inventory_hostname]['vcsaIp'] }} --vcenter-password '{{ jsonData.vcenter.password }}' --controller-root-password {{ jsonData.esx.password | b64decode }} --data-replication-factor {{ cluster.replicationFactor }} --node-ips {{ siteA | join(' ') }} {{ siteB | join(' ') }} {{ esxUsername if storfsRelease | version_compare('1.8.1a', '>=') else '' }} --accept-eula --vcenter-user {{ jsonData.vcenter.user }} --zone 2 --numzones 2 --clusterType 1 --data-zk-ip {{ hostvars[inventory_hostname]['witnessIp'] }} -f
+      async: 1800
+      poll: 60
+      when: clusterCreate == true
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"
+      register: clusterCreateOut
+      ignore_errors: true
+
+    - name: Send notification
+      slack:
+        token: T047GHA9Z/B4TV75STW/xJrMQxJkPs2UZ54tGPvo40HG
+        msg: "Job <https://tower.eng.storvisor.com/#/jobs/{{tower_job_id}}|{{tower_job_id}}> has completed \n {{ 'Cluster creation failed\n' if clusterCreateOut.rc != 0 else '' }}ESX: {{ node_ips | join(' ') }} \n Controllers: {{ cvm_ips | join(' ') }} \n Repl IPs: {{ repl_ips | unique | join(' ') }} \n Cluster: {{ hostvars[inventory_hostname]['clusterName'] }} - <https://{{ hostvars[inventory_hostname]['mgmtcip'] }}|{{ hostvars[inventory_hostname]['mgmtcip'] }}> \n vCenter: <https://{{ hostvars[inventory_hostname]['vcsaIp'] }}|{{ hostvars[inventory_hostname]['vcsaIp'] }}>\nLogin <https://tower-vc.eng.storvisor.com/ui/}here> with CEC credentials to manage VMs"
+        channel: "@{{ slackUsername }}"
+        color: "{{ 'danger' if clusterCreateOut.rc != 0 else 'good' }}"
+        username: 'ansiblebot'
+      delegate_to: localhost
+      when: tower_job_id is defined and slackUsername is defined
+      environment:
+        http_proxy: http://proxy.esl.cisco.com:8080
+        https_proxy: http://proxy.esl.cisco.com:8080
+
+
+    - name: Send notification
+      slack:
+        token: T047GHA9Z/B4TV75STW/xJrMQxJkPs2UZ54tGPvo40HG
+        msg: "{{ clusterCreateOut.stdout }}"
+        channel: "@{{ slackUsername }}"
+        color: "danger"
+        username: 'ansiblebot'
+      delegate_to: localhost
+      when: clusterCreateOut.rc is defined and clusterCreateOut.rc != 0 and slackUsername is defined
+      environment:
+        http_proxy: http://proxy.esl.cisco.com:8080
+        https_proxy: http://proxy.esl.cisco.com:8080
+
+
+    - name: Send notification
+      cisco_spark:
+        recipient_type: toPersonEmail
+        recipient_id: "{{ userId }}@cisco.com"
+        message_type: markdown
+        token: "M2MxMzg5NWEtZjAxYy00ZWU0LTg0MTAtNDA1ODI5YWNkZDVkZmM3YmVlNTAtZDQ1"
+        message: "Job [ {{tower_job_id}} ](https://tower.eng.storvisor.com/#/jobs/{{tower_job_id}}) has completed \n\n {{ 'Cluster creation failed\n\n' if clusterCreateOut.rc != 0 else '' }}**ESX**: {{ node_ips | join(', ') }} \n\n **Controllers**: {{ cvm_ips | join(', ') }} \n\n Repl IPs: {{ repl_ips | unique | join(', ') }} \n\n **Cluster**: {{ hostvars[inventory_hostname]['clusterName'] }} - [ {{ hostvars[inventory_hostname]['mgmtcip'] }} ](https://{{ hostvars[inventory_hostname]['mgmtcip'] }}) \n\n **vCenter**: [ {{ hostvars[inventory_hostname]['vcsaIp'] }} ](https://{{ hostvars[inventory_hostname]['vcsaIp'] }}) \n\n Login [here](https://tower-vc.eng.storvisor.com/ui/) with CEC credentials to manage VMs"
+      delegate_to: localhost
+      environment:
+        http_proxy: http://proxy.esl.cisco.com:8080
+        https_proxy: http://proxy.esl.cisco.com:8080
+      ignore_errors: true
+
+    - pause: seconds=30
+
+    - fail:
+        msg: "Cluster create was not successful"
+      when: clusterCreateOut.rc is defined and clusterCreateOut.rc != 0

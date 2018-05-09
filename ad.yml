@@ -1,0 +1,66 @@
+---
+
+- name: Run powershell script
+  hosts: all
+  gather_facts: false
+  tasks:
+
+    - name: create the vm
+      local_action:
+        module: vmware_guest
+        hostname: "se-vc01.eng.storvisor.com"
+        username: "administrator@vsphere.local"
+        password: "$torVis0r"
+        validate_certs: false
+        name: ad-test
+        state: "poweredon"
+        # folder: "{{ vm_folder }}"
+        datacenter: "HyperFlex-SE-Demo"
+        cluster: "HyperFlex-SE-CL01"
+        template: "win2k16-ad-template"
+        # annotation: "{{ vm_note }}"
+        wait_for_ip_address: true
+        networks:
+        - name: "simulator-mgmt"
+          device_type: vmxnet3
+          ip: "10.198.12.12"
+          netmask: "255.255.0.0"
+          gateway: "10.198.0.1"
+          dns_servers:
+            - 127.0.0.1
+            - 10.64.1.8
+        customization:
+          dns_servers:
+            - 127.0.0.1
+            - 10.64.1.8
+          password: Cisco123
+      register: deploy
+
+    - name: Waiting for Windows Host To Start
+      local_action:
+         module: wait_for
+             host="10.198.12.12"
+             port=5986
+             state=started
+             delay=10
+             timeout=1800
+
+    - name: Verify Host is Online
+      win_ping:
+      register: win_status
+      ignore_errors: true
+      until: win_status | success
+      retries: 30
+      delay: 10
+
+    - name: Setup AD
+      script: files/ad.ps1
+
+    - name: Waiting for Windows Host To Start
+      local_action:
+         module: wait_for
+             host="10.198.12.12"
+             port=5986
+             state=started
+             delay=60
+             timeout=1800

@@ -1,0 +1,493 @@
+
+#!/usr/bin/env ansible-playbook
+---
+
+- name: Initializing Configuration
+  hosts: localhost
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        ad_template_location: "{{ template_map[buildInfo.ad] }}"
+        hyperv_core_template_location: "{{ template_map[buildInfo.hyperv_core] }}"
+        hyperv_desktop_template_location: "{{ template_map[buildInfo.hyperv_desktop] }}"
+        controller_template_prefix: "{{ template_map[buildInfo.scvm].split('/')[5] }}"
+        replRoleType: "{{ cluster.replRoleType | default(omit, True) | lower }}"
+        ad_template_prefix: "{{ template_map[buildInfo.ad].split('/')[4] }}"
+        windows_template_prefix: "{{ template_map[buildInfo.hyperv_core].split('/')[4] }}"
+        adFound: false
+
+    - name: Set Template Name
+      set_fact:
+        ad_template: "{{ jsonData.deploy.vcCluster }}-{{ ad_template_prefix }}"
+        cvm_template: "{{ jsonData.deploy.vcCluster }}-{{ controller_template_prefix }}-controller"
+        ad_name: "{{ ad_template_prefix }}-{{ userId }}-{{ jsonData.deploy.vmPrefix }}"
+        ad_hostname: "{{ userId | regex_replace('\\.', '') }}-ad-server"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) }}"
+        windows_template_location: "{{ hyperv_core_template_location }}"
+
+    - name: Set Windows Image
+      set_fact:
+        windows_template: "{{ hyperv_desktop_template_location }}"
+        windows_template_prefix: "{{ template_map[buildInfo.hyperv_desktop].split('/')[4] }}"
+        windows_template_location: "{{ hyperv_desktop_template_location }}"
+      when: cluster.hypervDesktop
+
+    - name: Get Build Info
+      local_action:
+        module: getbuild.py
+        url: "{{ buildUrl }}"
+      environment:
+        no_proxy: 10.198.0.5
+
+    - name: Get IP Information
+      local_action:
+        module: reserve.py
+        clusterInfo: "{{ cluster }}"
+        jsonData: "{{ jsonData }}"
+        release: "{{ storfsRelease }}"
+        userId: "{{ userId }}"
+
+    - set_fact:
+        vm_name: "{{ jsonData.deploy.vmPrefix }}-{{ userId }}-{{ cluster.name }}-{{ storfsRelease }}-{{ nodes.values()[0].hypervisorMgmt }}"
+        windows_template: "{{ jsonData.deploy.vcCluster }}-{{ windows_template_prefix }}"
+
+    - name: Get AD IP
+      local_action:
+        module: reserve.py
+        jsonData: "{{ jsonData }}"
+        node: "{{ ad_name }}"
+
+
+    - name: extract hyperv host info
+      add_host: name={{ item.hypervisorMgmt }} group=esx
+                ansible_user="Administrator"
+                ansible_password={{ jsonData.vcenter.password }}
+                ansible_port="5986"
+                ansible_connection="winrm"
+                ansible_winrm_server_cert_validation="ignore"
+                esxip={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                scvmdataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+                adIp={{ vcsaIp | default(jsonData.vcenter.host) }}
+                hyperv_hostname={{ item.hostname }}
+                wincip={{ item.wincip }}
+                fchostname={{ item.fchostname }}
+                cvmhostname={{ item.cvmhostname }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: extract controller info
+      add_host: name={{ item.controllerMgmt }} group=controllers
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esx_host={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                dataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+                replip={{ item.controllerRepl }}
+                replcip={{ item.replcip }}
+                full_version=0
+                dns_server="{{ vcsaIp | default(jsonData.vcenter.host) }}"
+                ntpServer="{{ vcsaIp | default(jsonData.vcenter.host) }}"
+                preinstall_dir="{{ preinstall_dir }}"
+                wincip={{ item.wincip }}
+                fchostname={{ item.fchostname }}
+                cvmhostname={{ item.cvmhostname }}
+                adIp={{ vcsaIp | default(jsonData.vcenter.host) }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: extract cluster info
+      add_host: name={{ item.mgmtcip }} group=clusters
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esx_host={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                dataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+                adIp={{ vcsaIp | default(jsonData.vcenter.host) }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: extract ad host info
+      add_host: name={{ vcsaIp }} group=ad
+                ansible_user="Administrator"
+                ansible_password={{ jsonData.vcenter.password }}
+                ansible_port="5986"
+                ansible_connection="winrm"
+                ansible_winrm_server_cert_validation="ignore"
+                adFound="{{ adFound }}"
+      with_items:
+          - "{{ nodes.values() }}"
+
+
+- name: Install Packages
+  hosts: controllers
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+
+    - include: tasks/install.yml
+
+    - name: Remove older pbis package if any
+      shell: dpkg -r pbis-open-gui pbis-open-upgrade pbis-open
+      ignore_errors: true
+
+    - name: Purge older pbis package if any
+      shell: dpkg --purge pbis-open-gui pbis-open-upgrade pbis-open
+      ignore_errors: true
+
+    - name: Running hvinstall for Hyper-V Package
+      shell: /opt/springpath/storfs-hyperv/hvinstall.sh
+
+    - name: Verify lookup
+      shell: nslookup "ad-{{ userId[:12] }}.local"
+
+    - name: Get ctlvm hostname
+      shell: hostname
+      register: ctlvm_hostname
+
+    - name: Running hvinit for Hyper-V Package
+      shell: /opt/springpath/storfs-hyperv/hvinit.sh "{{ ctlvm_hostname.stdout }}" "{{ ctlvm_hostname.stdout }}d" "{{ cluster.name }}" "{{ hostvars[inventory_hostname]['adIp'] }}" "ad-{{ userId[:12] }}.local" "administrator" "Cisco123" ""
+      register: hv_init_status
+      until: hv_init_status | success
+      retries: 5
+      delay: 20
+
+    - pause:
+        seconds: 60
+
+    - name: Reboot Controller VM
+      shell: sync && reboot
+      async: 0
+      poll: 0
+
+    - name: Waiting for Controller to Restart
+      local_action:
+         module: wait_for
+             host={{ inventory_hostname }}
+             port=22
+             state=started
+             delay=60
+             timeout=1800
+
+- name: Generate Hyperv JSON Files
+  hosts: esx
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        domain: "ad-{{ userId[:12] }}.local"
+
+    - shell:
+        cmd: export NO_PROXY="{{inventory_hostname}}" && export no_proxy="{{inventory_hostname}}"
+      delegate_to: localhost
+
+    # - name: Turn off VM
+    #   win_shell: Get-VM -Name "StCtlVM" | Stop-VM -Force:$True -TurnOff:$True -ErrorAction Stop -Confirm:$False -Verbose
+    #
+    # - name: Set Dynamic memory
+    #   win_shell: Set-VMMemory -VMName "StCtlVM" -DynamicMemoryEnabled $True -MinimumBytes 4294967296 -MaximumBytes 53687091200 -Priority 100 -Confirm:$False
+    #
+    # - name: Turn on VM
+    #   win_shell: Get-VM -Name "StCtlVM" | Start-VM -ErrorAction Stop -Confirm:$False -Verbose
+    #
+
+    - name: Add hxadmin user
+      win_shell: "{{ item }}"
+      with_items:
+        - 'New-ADUser -Name hxadmin -SamAccountName hxadmin -AccountPassword (ConvertTo-SecureString -AsPlainText "Cisco123" -Force) -PassThru | Enable-ADAccount'
+        - 'Add-ADGroupMember -Identity "Domain Admins" -Members hxadmin'
+      delegate_to: "{{ hostvars[inventory_hostname]['adIp'] }}"
+      ignore_errors: true
+      run_once: true
+
+    - name: Disable expiration for hxadmin
+      win_shell: Set-LocalUser -Name "hxadmin" -PasswordNeverExpires 1
+      delegate_to: "{{ hostvars[inventory_hostname]['adIp'] }}"
+      ignore_errors: true
+      run_once: true
+
+    - name: Get Host UUID
+      win_shell: (Get-WmiObject -Class Win32_ComputerSystemProduct).uuid
+      register: hostUUID
+
+    - name: Get Host Serial
+      win_shell: (Get-WmiObject -Class Win32_BIOS).serialnumber
+      register: hostSerial
+
+    - name: Get Host Model
+      win_shell: (Get-WmiObject -Class Win32_ComputerSystem).model
+      register: hostModel
+
+    - name: Get VM ID
+      win_shell: (Get-VM StCtlVM).id | foreach { $_.Guid }
+      register: controllerVMID
+
+    - name: Get CVM UUID
+      shell: dmidecode | grep UUID | awk '{print $NF}'
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"
+      register: controllerUUID
+
+    - name: Generate jsonData
+      local_action:
+        module: generate_inventory.py
+        nodes: "{{ hostvars }}"
+        jsonData: "{{ jsonData }}"
+        dnsServers: "{{ hostvars[inventory_hostname]['adIp'] }}"
+        domain: "{{ domain }}"
+
+    - name: Copy inventory JSON to controllers
+      copy:
+        content: " {{ inventoryJSON | to_nice_json(indent=2) }}"
+        dest: /etc/springpath/secure/hxinstall_inventory.json
+        force: yes
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"
+
+    - name: Copy auth JSON to controllers
+      copy:
+        content: " {{ authJSON | to_nice_json(indent=2) }}"
+        dest: /etc/springpath/secure/auth.json
+        force: yes
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"
+
+    - name: Create local_hypervisor file
+      lineinfile: >
+          dest="/etc/local_hypervisor" mode=0644
+          line={{ 'localhv=' + hostvars[inventory_hostname]['hyperv_hostname'] + '.' + domain }} create=yes
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"
+
+    # - name: Setup CIP hosts file
+    #   win_lineinfile:
+    #     path: C:\Windows\System32\drivers\etc\hosts
+    #     line: "{{ hostvars[inventory_hostname]['scvmdataip'] }}  {{ hostvars[inventory_hostname]['clusterName'] + '.' + domain }}"
+    #
+    # - name: Copy psexec
+    #   win_copy:
+    #     src: files/psexec.exe
+    #     dest: C:\windows\system32\psexec.exe
+    #
+    # - name: Copy keytab Script
+    #   win_copy:
+    #     src: files/keytab.bat
+    #     dest: C:\temp\keytab.bat
+    #
+    # - name: Setup keytab
+    #   win_shell: C:\temp\keytab.bat cifs/{{ hostvars[inventory_hostname]['clusterName'] }}.{{ domain }}@{{ domain | upper }} {{ hostvars[inventory_hostname]['clusterName'] + '$' }} {{ domain }}
+    #   args:
+    #     executable: cmd
+    #
+    # - name: Copy keytab to CVM
+    #   win_shell: Copy-VMFile -SourcePath c:\Temp\hxcluster.keytab -DestinationPath /tmp -FileSource Host -VMName StCtlvm -Force
+    #
+    # - name: Merge keytab
+    #   shell: /opt/springpath/storfs-hyperv/merge_keytab_files.sh /tmp/hxcluster.keytab
+    #   delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"
+
+
+- name: Create Cluster
+  hosts: clusters
+  become: false
+  gather_facts: no
+  serial: 1
+  vars:
+    - clusterCreate: true
+
+  tasks:
+
+    - block:
+
+      - set_fact:
+          cvmList: []
+
+      - set_fact:
+          cvmList: "{{ cvmList + [ {'uuid':  hostvars[item].controllerUUID.stdout_lines[0] | lower, 'ip': hostvars[item].scvmip } ] }}"
+        with_items: "{{ groups['esx'] }}"
+
+      - set_fact:
+          domain: "ad-{{ userId[:12] }}.local"
+
+      - name: Setup payload
+        set_fact:
+          body:
+            name: "{{ hostvars[inventory_hostname]['clusterName'] }}"
+            ctlVmMgmtIpList: "{{ cvmList }}"
+            clusterMgmtIp: "{{ hostvars[inventory_hostname]['mgmtcip'] }}"
+            clusterDataIp: "{{ hostvars[inventory_hostname]['datacip'] }}"
+            size: "{{ hostvars[inventory_hostname]['nodecount'] }}"
+            dataReplicationFactor: "{{ 'TWO_COPIES' if hostvars[inventory_hostname]['nodecount'] > 1 else 'ONE_COPY' }}"
+            clusterAccessPolicy: "LENIENT"
+            workloadType: "VSI"
+            diskEncryptionCapability: "NOT_SUPPORTED"
+            zoneType: 0
+
+      - debug:
+          msg:
+            - "Hyper-V Hosts: {{ groups['esx'] | map('extract', hostvars, ['inventory_hostname']) | join(', ') }}"
+            - "Controllers: {{ groups['controllers'] | map('extract', hostvars, ['inventory_hostname']) | join(',') }}"
+            - "AD: {{ hostvars[inventory_hostname]['adIp'] }}"
+
+      - name: Create Cluster
+        uri:
+          url: "https://{{hostvars[inventory_hostname]['scvmip'] }}/coreapi/v1/clusters"
+          method: POST
+          user: "root"
+          password: "{{ jsonData.esx.password | b64decode }}"
+          body: "{{ body }}"
+          status_code: 202
+          body_format: json
+          return_content: yes
+          validate_certs: no
+          force_basic_auth: yes
+          headers:
+            Content-Type: "application/json"
+            Auth-Hv-Ad-User-Name: "{{ ('hxadmin@' + domain) | b64encode }}"
+            Auth-Hv-Ad-Password: "{{ jsonData.esx.password }}"
+            Auth-Hv-Host-User-Name: "{{ 'Administrator' | b64encode }}"
+            Auth-Hv-Host-Password: "{{ jsonData.esx.password }}"
+        register: createClusterJob
+        delegate_to: localhost
+
+      - name: Get Job Status
+        uri:
+          url: "https://{{hostvars[inventory_hostname]['scvmip'] }}/coreapi/v1/clusters/jobs/{{ createClusterJob.json.jobId }}"
+          method: GET
+          user: "root"
+          password: "{{ jsonData.esx.password | b64decode }}"
+          status_code: 200
+          validate_certs: no
+          return_content: yes
+          force_basic_auth: yes
+          headers:
+            Content-Type: "application/json"
+        register: jobStatus
+        retries: 300
+        delay: 30
+        until: jobStatus.json.state is defined and (jobStatus.json.state == 'COMPLETED' or jobStatus.json.state == 'EXCEPTION')
+        delegate_to: localhost
+        ignore_errors: true
+
+      - fail:
+          msg: "Cluster creation failed"
+        when: jobStatus.json.summaryStepState == 'FAILED'
+
+      - name: Get Cluster UUID
+        uri:
+          url: "https://{{hostvars[inventory_hostname]['scvmip'] }}/coreapi/v1/clusters"
+          method: GET
+          user: "root"
+          password: "{{ jsonData.esx.password | b64decode }}"
+          status_code: 200
+          validate_certs: no
+          return_content: yes
+          force_basic_auth: yes
+          headers:
+            Content-Type: "application/json"
+        register: clusterOutput
+        delegate_to: localhost
+
+      - name: Get Cluster Health
+        uri:
+          url: "https://{{hostvars[inventory_hostname]['scvmip'] }}/coreapi/v1/clusters/{{ clusterOutput.json[0].uuid }}/status"
+          method: GET
+          user: "root"
+          password: "{{ jsonData.esx.password | b64decode }}"
+          status_code: 200
+          validate_certs: no
+          return_content: yes
+          force_basic_auth: yes
+          headers:
+            Content-Type: "application/json"
+        register: healthOutput
+        until: healthOutput.json.resiliencyStatus == 'HEALTHY'
+        delegate_to: localhost
+        retries: 5
+        delay: 30
+
+
+      - name: Setup payload
+        set_fact:
+          datastore:
+            name: "ds01"
+            sizeInBytes: 536870912000
+            dataBlockSizeInBytes: 8192
+
+      - set_fact:
+          auth:
+            username: "local/root"
+            password: "{{ jsonData.esx.password | b64decode }}"
+            client_id: "HxGuiClient"
+            client_secret: "Sunnyvale"
+            redirect_uri: "htts://{{hostvars[inventory_hostname]['scvmip'] }}"
+
+      - name: Get Token
+        uri:
+          url: "https://{{hostvars[inventory_hostname]['scvmip'] }}/aaa/v1/auth?grant_type=password"
+          method: POST
+          body: "{{ auth }}"
+          status_code: 201
+          body_format: json
+          return_content: yes
+          validate_certs: no
+          headers:
+            Content-Type: "application/json"
+        delegate_to: localhost
+        register: authToken
+        retries: 5
+        delay: 30
+
+      - name: Create Datastore
+        uri:
+          url: "https://{{hostvars[inventory_hostname]['scvmip'] }}/hx/api/clusters/1/datastores"
+          method: POST
+          body: "{{ datastore }}"
+          status_code: 200
+          body_format: json
+          return_content: yes
+          validate_certs: no
+          headers:
+            token: "{{ authToken.json.access_token }}"
+            tokenType: "Basic"
+            Content-Type: "application/json"
+        delegate_to: localhost
+        retries: 5
+        delay: 30
+        when: dsCreate is not defined
+
+      when: clusterCreate == true

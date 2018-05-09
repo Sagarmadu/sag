@@ -1,0 +1,222 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        esx_template_location: "{{ template_map[buildInfo.esx] }}"
+        vcsa_template_location: "{{ template_map[buildInfo.vcsa] }}"
+        vcsa_template_prefix: "{{ template_map[buildInfo.vcsa].split('/')[4] }}"
+        esx_template_prefix: "{{ template_map[buildInfo.esx].split('/')[4] }}"
+        controller_template_prefix: "{{ template_map[buildInfo.scvm].split('/')[4] }}"
+        replRoleType: "{{ cluster.replRoleType | default(omit, True) | lower }}"
+        storfsRelease: "2.5.1a"
+
+    - name: Set Template Name
+      set_fact:
+        template_name: "{{ jsonData.deploy.vcCluster }}-{{ esx_template_prefix }}"
+        vcsa_template: "{{ jsonData.deploy.vcCluster }}-{{ vcsa_template_prefix }}"
+        cvm_template: "{{ jsonData.deploy.vcCluster }}-{{ controller_template_prefix }}-controller"
+        vcsa_name: "{{ vcsa_template_prefix }}-{{ userId }}-{{ jsonData.deploy.vmPrefix }}"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) }}"
+
+    - set_fact:
+        vcsa_name: "{{ vcsa_template_prefix }}-{{ userId }}-{{ jsonData.deploy.vmPrefix }}-source"
+      when: replRoleType is defined and replRoleType == 'source'
+
+    - set_fact:
+        vcsa_name: "{{ vcsa_template_prefix }}-{{ userId }}-{{ jsonData.deploy.vmPrefix }}-target"
+      when: replRoleType is defined and replRoleType == 'target'
+
+    - name: Get IP Information
+      local_action:
+        module: reserve.py
+        clusterInfo: "{{ cluster }}"
+        jsonData: "{{ jsonData }}"
+        release: "2.5.1a"
+        userId: "{{ userId }}"
+
+    - name: Get VCSA IP
+      local_action:
+        module: reserve.py
+        jsonData: "{{ jsonData }}"
+        node: "{{ vcsa_name }}"
+
+    - name: extract esx host info
+      add_host: name={{ item.hypervisorMgmt }} group=esx
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esxip={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                scvmdataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsRelease={{ storfsRelease }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: extract controller info
+      add_host: name={{ item.controllerMgmt }} group=controllers
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esx_host={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                dataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsRelease={{ storfsRelease }}
+                replip={{ item.controllerRepl }}
+                replcip={{ item.replcip }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: extract cluster info
+      add_host: name={{ item.mgmtcip }} group=clusters
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esx_host={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                dataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsRelease={{ storfsRelease }}
+                vcsaIp={{ vcsaIp | default(jsonData.vcenter.host) }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+- name: Setup Cluster
+  hosts: clusters
+  become: false
+  gather_facts: no
+  serial: 1
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        node_ips: []
+        cvm_ips: []
+        repl_ips: []
+        replRoleType: "{{ cluster.replRoleType | default(omit, True) }}"
+
+    - set_fact:
+        node_ips: "{{ node_ips }} + [ '{{ hostvars[item].esx_host }}' ]"
+        cvm_ips: "{{ cvm_ips }} + [ '{{ hostvars[item].scvmip }}' ]"
+        pairingInfo: "{{ lookup('file', '/opt/sysmgmt/testbeds/sandbox/pair.yml') | from_yaml }}"
+      with_items: "{{ groups['controllers'] }}"
+      when: hostvars[item].mgmtcip == inventory_hostname
+
+    - set_fact:
+        repl_ips: "{{ repl_ips }} + [ '{{ hostvars[item].replip }}' ]"
+      with_items: "{{ groups['controllers'] }}"
+      when: hostvars[item].mgmtcip == inventory_hostname and replRoleType is defined
+
+    - set_fact:
+        repl_ips: "{{ repl_ips }} + [ '{{ hostvars[item].replcip }}' ]"
+      with_items: "{{ groups['controllers'] }}"
+      when: replRoleType is defined
+
+    - name: Deploy ESX template from OVA
+      local_action:
+        module: deployOva
+        datastore: "ds-{{ replRoleType }}"
+        network: "VM Network"
+        name: "{{ item }}"
+        ovalocation: "http://10.198.0.5/springpath/tinyvm.ova"
+        esxUserName: "root"
+        esxPassword: "Q2lzY28xMjM="
+        hostname: "{{ groups['esx'][0] }}"
+        modelNumber: "simulator"
+      with_items:
+        - "dr-sandbox-vm1"
+        - "dr-sandbox-vm2"
+      register: ret
+      until: ret | success
+      retries: 5
+
+    - name: Power on VM
+      local_action:
+        module: vmware_guest
+        hostname: "{{ pairingInfo[buildVM].srcVC }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+        cluster: "{{ pairingInfo[buildVM].srcCluster }}"
+        datacenter: "{{ pairingInfo[buildVM].srcDC }}"
+        name: "{{ item }}"
+        state: poweredon
+        folder: "/{{ pairingInfo[buildVM].srcDC }}/vm/Discovered virtual machine"
+      with_items:
+        - "dr-sandbox-vm1"
+        - "dr-sandbox-vm2"
+      register: ret
+      until: ret | success
+      retries: 5
+
+    - name: Setup pairing
+      shell: stcli dp peer add --name srcToTarget --description test-pair --mgmtIp {{ pairingInfo[buildVM].destMgmtIp }} --username administrator@vsphere.local --password Cisco123
+      register: ret
+      until: ret | success
+      retries: 5
+
+    - name: Edit pairing
+      shell: stcli dp peer datastore edit --name srcToTarget --datastore {{ pairingInfo[buildVM].sourceDS }}:{{ pairingInfo[buildVM].targetDS }}:ADD
+      register: ret
+      until: ret | success
+      retries: 5
+
+- name: Get ESX Info
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - name: Get BIOS UUID
+      shell: vim-cmd vmsvc/get.config $(vim-cmd vmsvc/getallvms | grep dr-sandbox-vm1 | awk '{print $1}') | grep uuid | cut -d \" -f2
+      register: vm1_uuid
+
+    - name: Get BIOS UUID
+      shell: vim-cmd vmsvc/get.config $(vim-cmd vmsvc/getallvms | grep dr-sandbox-vm2 | awk '{print $1}') | grep uuid | cut -d \" -f2
+      register: vm2_uuid
+
+    - local_action:
+        module: copy
+        src: /opt/sysmgmt/testbeds/sandbox/testbed.conf
+        dest: /opt/sysmgmt/testbeds/sandbox/{{ buildVM }}_testbed.conf
+        force: yes
+        remote_src: True
+
+    - local_action:
+        module: replace
+        dest: /opt/sysmgmt/testbeds/sandbox/{{ buildVM }}_testbed.conf
+        regexp: 'UUID1'
+        replace: "{{ vm1_uuid.stdout }}"
+
+    - local_action:
+        module: replace
+        dest: /opt/sysmgmt/testbeds/sandbox/{{ buildVM }}_testbed.conf
+        regexp: 'UUID2'
+        replace: "{{ vm2_uuid.stdout }}"

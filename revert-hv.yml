@@ -1,0 +1,243 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        ad_template_location: "{{ template_map[buildInfo.ad] }}"
+        hyperv_core_template_location: "{{ template_map[buildInfo.hyperv_core] }}"
+        hyperv_desktop_template_location: "{{ template_map[buildInfo.hyperv_desktop] }}"
+        controller_template_prefix: "{{ template_map[buildInfo.scvm].split('/')[5] }}"
+        replRoleType: "{{ cluster.replRoleType | default(omit, True) | lower }}"
+        ad_template_prefix: "{{ template_map[buildInfo.ad].split('/')[4] }}"
+        windows_template_prefix: "{{ template_map[buildInfo.hyperv_core].split('/')[4] }}"
+        powerVMS: "{{ powerVMS | default(true) | bool }}"
+        adFound: false
+
+    - debug:
+        msg: "{{ powerVMS }}"
+
+    - name: Set Template Name
+      set_fact:
+        ad_template: "{{ jsonData.deploy.vcCluster }}-{{ ad_template_prefix }}"
+        cvm_template: "{{ jsonData.deploy.vcCluster }}-{{ controller_template_prefix }}-controller"
+        ad_name: "{{ ad_template_prefix }}-{{ userId }}-{{ jsonData.deploy.vmPrefix }}"
+        ad_hostname: "{{ userId | regex_replace('\\.', '') }}-ad-server"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) }}"
+        windows_template_location: "{{ hyperv_core_template_location }}"
+
+    - name: Set Windows Image
+      set_fact:
+        windows_template: "{{ hyperv_desktop_template_location }}"
+        windows_template_prefix: "{{ template_map[buildInfo.hyperv_desktop].split('/')[4] }}"
+        windows_template_location: "{{ hyperv_desktop_template_location }}"
+      when: cluster.hypervDesktop
+
+    - name: Get Build Info
+      set_fact:
+        storfsRelease: "2.5.1a"
+        storfsBuild: "10000"
+        package: "stofs-packages.tar.gz"
+
+
+    - name: Get IP Information
+      local_action:
+        module: reserve.py
+        clusterInfo: "{{ cluster }}"
+        jsonData: "{{ jsonData }}"
+        release: "{{ storfsRelease }}"
+        userId: "{{ userId }}"
+
+    - set_fact:
+        vm_name: "{{ jsonData.deploy.vmPrefix }}-{{ userId }}-{{ cluster.name }}-{{ storfsRelease }}-{{ nodes.values()[0].hypervisorMgmt }}"
+        windows_template: "{{ jsonData.deploy.vcCluster }}-{{ windows_template_prefix }}"
+
+    - name: extract hyperv host info
+      add_host: name={{ item.hypervisorMgmt }} group=esx
+                ansible_user="Administrator"
+                ansible_password={{ jsonData.vcenter.password }}
+                ansible_port="5986"
+                ansible_connection="winrm"
+                ansible_winrm_server_cert_validation="ignore"
+                esxip={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                scvmdataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+                adIp={{ vcsaIp | default(jsonData.vcenter.host) }}
+                hyperv_hostname={{ item.hostname }}
+                wincip={{ item.wincip }}
+                fchostname={{ item.fchostname }}
+                cvmhostname={{ item.cvmhostname }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: extract controller info
+      add_host: name={{ item.controllerMgmt }} group=controllers
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esx_host={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                dataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+                replip={{ item.controllerRepl }}
+                replcip={{ item.replcip }}
+                full_version=0
+                dns_server="{{ vcsaIp | default(jsonData.vcenter.host) }}"
+                ntpServer="{{ vcsaIp | default(jsonData.vcenter.host) }}"
+                preinstall_dir="{{ preinstall_dir }}"
+                wincip={{ item.wincip }}
+                fchostname={{ item.fchostname }}
+                cvmhostname={{ item.cvmhostname }}
+                adIp={{ vcsaIp | default(jsonData.vcenter.host) }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: extract cluster info
+      add_host: name={{ item.mgmtcip }} group=clusters
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esx_host={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                dataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+                adIp={{ vcsaIp | default(jsonData.vcenter.host) }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: Revert to a snapshot
+      local_action:
+        module: vmware_guest_snapshot
+        hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+        datacenter: "{{ jsonData.deploy.vcDatacenter }}"
+        folder: "/{{ jsonData.deploy.vcDatacenter }}/vm/{{ jsonData.deploy.vcCluster }}-simulators"
+        name: "{{ ad_name }}"
+        state: revert
+        snapshot_name: clean
+      when: powerVMS
+
+    - name: Power on VM
+      local_action:
+        module: vmware_guest
+        hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+        cluster: "{{ jsonData.deploy.vcCluster }}"
+        datacenter: "{{ jsonData.deploy.vcDatacenter }}"
+        folder: "/{{ jsonData.deploy.vcDatacenter }}/vm/{{ jsonData.deploy.vcCluster }}-simulators"
+        name: "{{ ad_name }}"
+        state: poweredon
+      when: powerVMS
+
+    - name: Power off VM
+      local_action:
+        module: vmware_guest
+        hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+        cluster: "{{ jsonData.deploy.vcCluster }}"
+        datacenter: "{{ jsonData.deploy.vcDatacenter }}"
+        folder: "/{{ jsonData.deploy.vcDatacenter }}/vm/{{ jsonData.deploy.vcCluster }}-simulators"
+        name: "{{ ad_name }}"
+        state: poweredoff
+      when: not powerVMS
+
+
+- name: Configure ESX
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        vm_name: "{{ jsonData.deploy.vmPrefix }}-{{ userId }}-{{ hostvars[inventory_hostname]['clusterName'] }}-{{ inventory_hostname }}"
+        cvm_name: "stCtlVM-{{ inventory_hostname }}"
+        storfsRelease: "{{ hostvars[inventory_hostname]['storfsRelease'] }}"
+        storfsBuild: "{{ hostvars[inventory_hostname]['storfsBuild'] }}"
+        replRoleType: "{{ cluster.replRoleType | default(omit) }}"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) | regex_replace('latest', storfsBuild) }}"
+        ad_template: "{{ jsonData.deploy.vcCluster }}-ad"
+        hyperv_template: "{{ jsonData.deploy.vcCluster }}-{{ template_map[buildInfo.hyperv_core].split('/')[4] }}"
+        computer_name: "{{ userId }}-{{ cluster.name }}"
+        powerVMS: "{{ powerVMS | default(true) | bool }}"
+
+
+    - name: Revert to a snapshot
+      local_action:
+        module: vmware_guest_snapshot
+        hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+        datacenter: "{{ jsonData.deploy.vcDatacenter }}"
+        folder: "/{{ jsonData.deploy.vcDatacenter }}/vm/{{ jsonData.deploy.vcCluster }}-simulators"
+        name: "{{ vm_name }}"
+        state: revert
+        snapshot_name: clean
+      when: powerVMS
+
+    - name: Power on VM
+      local_action:
+        module: vmware_guest
+        hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+        cluster: "{{ jsonData.deploy.vcCluster }}"
+        datacenter: "{{ jsonData.deploy.vcDatacenter }}"
+        folder: "/{{ jsonData.deploy.vcDatacenter }}/vm/{{ jsonData.deploy.vcCluster }}-simulators"
+        name: "{{ vm_name }}"
+        state: poweredon
+      when: powerVMS
+
+    - name: Power off VM
+      local_action:
+        module: vmware_guest
+        hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+        cluster: "{{ jsonData.deploy.vcCluster }}"
+        datacenter: "{{ jsonData.deploy.vcDatacenter }}"
+        folder: "/{{ jsonData.deploy.vcDatacenter }}/vm/{{ jsonData.deploy.vcCluster }}-simulators"
+        name: "{{ vm_name }}"
+        state: poweredoff
+      when: not powerVMS

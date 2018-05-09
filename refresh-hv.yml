@@ -1,0 +1,247 @@
+#!/usr/bin/env ansible-playbook
+---
+
+- name: Initializing Configuration
+  hosts: localhost
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+    - include: tasks/init-ad.yml
+
+- name: Configure Active Directory
+  hosts: ad
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  tasks:
+    - shell:
+        cmd: export NO_PROXY="{{inventory_hostname}}" && export no_proxy="{{inventory_hostname}}"
+      delegate_to: localhost
+
+    - name: Wait for Host Reboot
+      wait_for_connection:
+        retries: 20
+        delay: 30
+      when: not hostvars[inventory_hostname]['adFound']
+
+    - name: Setup NTP
+      win_shell: "{{ item }}"
+      with_items:
+        - w32tm /config /manualpeerlist:"{{ jsonData.ntp }}"
+        - tzutil /s "Pacific Standard Time"
+
+    - name: Setup AD
+      script: files/ad.ps1 "ad-{{ userId[:12] }}"
+      when: not hostvars[inventory_hostname]['adFound']
+
+    - name: Wait for Host Reboot
+      wait_for_connection:
+        retries: 20
+        delay: 30
+      when: not hostvars[inventory_hostname]['adFound']
+
+
+- name: Deploy Hyper-V Template
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+    - shell:
+        cmd: export NO_PROXY="{{inventory_hostname}}" && export no_proxy="{{inventory_hostname}}"
+      delegate_to: localhost
+
+    - include: tasks/hyperv.yml
+
+- name: Setup hyperv hosts
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+  vars:
+     json_dir_local: './roles/hyperv/files'
+     json_dir_remote: 'C:\ProgramData\Cisco\HyperFlex\Install\ISO\hxinstall'
+     json_file_network_remote: '{{ json_dir_remote }}\network.json'
+     json_file_virtual_remote: '{{ json_dir_remote }}\virt.json'
+     psm_file_remote: '{{ json_dir_remote }}\HXBootStrap.psm1'
+     ps_file_remote: '{{ json_dir_remote }}\Start-HostBootStrap.ps1'
+     xml_file_remote: '{{ json_dir_remote }}\HXInstallbootstraplauncherTask.xml'
+
+     bootstrap_ps_file: 'Start-HostBootStrap.ps1'
+     bootstrap_psm_file: 'HXBootStrap.psm1'
+     bootstrap_xml_file: 'HXInstallbootstraplauncherTask.xml'
+     task_launch: 'Set-SerializedScheduledTasks.ps1'
+     task_run: 'Run-SerializedScheduledTasks.ps1'
+     task_delete: 'Del-SerializedScheduledTasks.ps1'
+     task_0: 'Task-RemoveBootStrapFailedFile'
+     task_1: 'Task-SetWindowsJoinFailOverCluster'
+     task_2: 'Task-SetAddHXAdminToLocalAdminGroup'
+     task_3: 'Task-SetStorageDataNetwork'
+     task_4: 'Task-SetHXControllerVM'
+     task_5: 'Task-SetHXControllerVMDisk'
+     task_6: 'Task-StartVM'
+     task_7: 'Task-SetVMHostnameIPAddresses'
+     task_8: 'Task-SetComputerAccounts'
+     task_9: 'Task-StopVM'
+     task_10: 'Task-SetRegistryValue'
+     task_11: 'Task-SetHyperVHostConfig'
+     task_12: 'Task-SetHighPerformancePowerState'
+     task_13: 'Task-SetConstrainedDelegation'
+     task_14: 'Task-SetHostCredSSP'
+     task_15: 'Task-SetBootstrapDone'
+
+  tasks:
+
+    - shell:
+        cmd: export NO_PROXY="{{inventory_hostname}}" && export no_proxy="{{inventory_hostname}}"
+      delegate_to: localhost
+
+    - name: Generate jsonData
+      local_action:
+        module: generate_json.py
+        nodes: "{{ hostvars[inventory_hostname] }}"
+        jsonData: "{{ jsonData }}"
+        dnsServers: "{{ hostvars[inventory_hostname]['adIp'] }}"
+        domain: "ad-{{ userId[:12] }}.local"
+
+    - name: Create install directory
+      win_file:
+        path: "{{ json_dir_remote }}"
+        state: directory
+
+    - name: Verify directory structure
+      win_file:
+          path: "{{ json_dir_remote }}"
+          state: directory
+
+    - name: Copy Virt JSON
+      win_copy:
+          content: "{{ virt_json }}"
+          dest: "{{ json_file_virtual_remote }}"
+
+    - name: Copy Network JSON
+      win_copy:
+          content: "{{ network_json }}"
+          dest: "{{ json_file_network_remote }}"
+
+    - name: Copy Core Powershell files
+      win_copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dst }}"
+      with_items:
+        - { src: "{{ json_dir_local }}/{{ bootstrap_ps_file }}", dst: "{{ json_dir_remote }}\\{{ bootstrap_ps_file }}" }
+        - { src: "{{ json_dir_local }}/{{ bootstrap_psm_file }}", dst: "{{ json_dir_remote }}\\{{ bootstrap_psm_file }}" }
+        - { src: "{{ json_dir_local }}/{{ bootstrap_xml_file }}", dst: "{{ json_dir_remote }}\\{{ bootstrap_xml_file }}" }
+        - { src: "{{ json_dir_local }}/{{ task_launch }}", dst: "{{ json_dir_remote }}\\{{ task_launch }}" }
+        - { src: "{{ json_dir_local }}/{{ task_run }}", dst: "{{ json_dir_remote }}\\{{ task_run }}" }
+        - { src: "{{ json_dir_local }}/{{ task_delete }}", dst: "{{ json_dir_remote }}\\{{ task_delete }}" }
+
+    - set_fact:
+        taskfiles:
+          - { src: "{{ json_dir_local }}/{{ task_0 }}", dst: "{{ json_dir_remote }}\\{{ task_0 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_1 }}", dst: "{{ json_dir_remote }}\\{{ task_1 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_2 }}", dst: "{{ json_dir_remote }}\\{{ task_2 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_3 }}", dst: "{{ json_dir_remote }}\\{{ task_3 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_4 }}", dst: "{{ json_dir_remote }}\\{{ task_4 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_5 }}", dst: "{{ json_dir_remote }}\\{{ task_5 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_6 }}", dst: "{{ json_dir_remote }}\\{{ task_6 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_7 }}", dst: "{{ json_dir_remote }}\\{{ task_7 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_8 }}", dst: "{{ json_dir_remote }}\\{{ task_8 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_9 }}", dst: "{{ json_dir_remote }}\\{{ task_9 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_10 }}", dst: "{{ json_dir_remote }}\\{{ task_10 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_11 }}", dst: "{{ json_dir_remote }}\\{{ task_11 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_12 }}", dst: "{{ json_dir_remote }}\\{{ task_12 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_13 }}", dst: "{{ json_dir_remote }}\\{{ task_13 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_14 }}", dst: "{{ json_dir_remote }}\\{{ task_14 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_15 }}", dst: "{{ json_dir_remote }}\\{{ task_15 }}" }
+
+    - name: Copy Scheduled Tasks Powershell Scripts
+      win_copy:
+        src: "{{ item.src }}.ps1"
+        dest: "{{ item.dst }}.ps1"
+      with_items: "{{ taskfiles }}"
+
+    - name: Copy Scheduled Tasks XML Files
+      win_copy:
+        src: "{{ item.src }}.xml"
+        dest: "{{ item.dst }}.xml"
+      with_items: "{{ taskfiles }}"
+
+    - name: Verify Connection
+      wait_for_connection:
+        retries: 20
+        delay: 5
+
+- name: Playbook HyperV Hosts
+  hosts: esx
+  gather_facts: no
+
+  roles:
+     - hyperv
+
+- name: Install Packages
+  hosts: controllers
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+
+    - set_fact:
+        node_ips: "{{ groups['esx'] | join(' ') }}"
+        vm_name: "stCtlVM-{{ inventory_hostname }}"
+        storfsRelease: "{{ hostvars[inventory_hostname]['storfsRelease'] }}"
+        storfsBuild: "{{ hostvars[inventory_hostname]['storfsBuild'] }}"
+        package: "{{ hostvars[inventory_hostname]['package'] }}"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) | regex_replace('latest', storfsBuild) }}"
+
+    - name: Waiting for Controller to Restart
+      local_action:
+         module: wait_for
+             host={{ inventory_hostname }}
+             port=22
+             state=started
+             delay=10
+             timeout=1800
+
+    - name: Initializing Storage Controller VM for Installation
+      shell: mount -t tmpfs -o size=4g tmpfs /tmp
+
+    - debug:
+        msg: "Release: {{ storfsRelease }} Build: {{ storfsBuild }}"
+
+    - stat: path="/etc/stvboot.cfg"
+      register: stvboot
+
+    - name: Extract Deploy Packages
+      get_url:
+        url: "http://10.198.0.5/springpath/deb/storfs-appliance.deb"
+        dest: /tmp
+      when: not stvboot.stat.exists|bool or stvboot.stat.size == 0
+
+    - name: Installing Preliminary Packages
+      shell: find /tmp -name storfs-appliance*.deb | xargs dpkg -i
+      when: not stvboot.stat.exists|bool or stvboot.stat.size == 0
+
+    # - name: Installing Preliminary Packages
+    #   shell: find /tmp -name storfs-fw*.deb | xargs dpkg -i
+    #   when: not stvboot.stat.exists|bool or stvboot.stat.size == 0
+
+    - name: Create bootdev
+      shell: /usr/share/springpath/storfs-appliance/config-bootdev.sh -r -y; poweroff
+      when: not stvboot.stat.exists|bool or stvboot.stat.size == 0
+
+
+- name: Cleanup
+  hosts: esx
+  gather_facts: no
+
+  tasks:
+     - name: Shutdown VM
+       win_shell: Stop-Computer -Confirm:$false -Force

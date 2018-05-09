@@ -1,0 +1,497 @@
+#!/usr/bin/env ansible-playbook
+---
+
+- name: Initializing Configuration
+  hosts: localhost
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+    - include: tasks/init-ad.yml
+
+- name: Configure Active Directory
+  hosts: ad
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  tasks:
+
+    - shell:
+        cmd: export NO_PROXY="{{inventory_hostname}}" && export no_proxy="{{inventory_hostname}}"
+      delegate_to: localhost
+
+    - name: Wait for Host Reboot
+      wait_for_connection:
+        retries: 60
+        delay: 30
+      proxy_env:
+        no_proxy: 10.198.1.18
+      environment:
+        no_proxy: 10.198.1.18
+      when: not hostvars[inventory_hostname]['adFound']
+
+    - name: Setup NTP
+      win_shell: "{{ item }}"
+      with_items:
+        - w32tm /config /manualpeerlist:"{{ jsonData.ntp }}"
+        - tzutil /s "Pacific Standard Time"
+
+    - name: Setup AD
+      script: files/ad.ps1 "ad-{{ userId[:12] }}"
+      when: not hostvars[inventory_hostname]['adFound']
+
+    - name: Wait for Host Reboot
+      wait_for_connection:
+        retries: 20
+        delay: 30
+      when: not hostvars[inventory_hostname]['adFound']
+
+
+- name: Deploy Hyper-V Template
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+    - shell:
+        cmd: export NO_PROXY="{{inventory_hostname}}" && export no_proxy="{{inventory_hostname}}"
+      delegate_to: localhost
+
+    - include: tasks/hyperv.yml
+
+- name: Setup hyperv hosts
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+  vars:
+     json_dir_local: './roles/hyperv/files'
+     json_dir_remote: 'C:\ProgramData\Cisco\HyperFlex\Install\ISO\hxinstall'
+     json_file_network_remote: '{{ json_dir_remote }}\network.json'
+     json_file_virtual_remote: '{{ json_dir_remote }}\virt.json'
+     psm_file_remote: '{{ json_dir_remote }}\HXBootStrap.psm1'
+     ps_file_remote: '{{ json_dir_remote }}\Start-HostBootStrap.ps1'
+     xml_file_remote: '{{ json_dir_remote }}\HXInstallbootstraplauncherTask.xml'
+
+     bootstrap_ps_file: 'Start-HostBootStrap.ps1'
+     bootstrap_psm_file: 'HXBootStrap.psm1'
+     bootstrap_xml_file: 'HXInstallbootstraplauncherTask.xml'
+     task_launch: 'Set-SerializedScheduledTasks.ps1'
+     task_run: 'Run-SerializedScheduledTasks.ps1'
+     task_delete: 'Del-SerializedScheduledTasks.ps1'
+     task_0: 'Task-RemoveBootStrapFailedFile'
+     task_1: 'Task-SetWindowsJoinFailOverCluster'
+     task_2: 'Task-SetAddHXAdminToLocalAdminGroup'
+     task_3: 'Task-SetStorageDataNetwork'
+     task_4: 'Task-SetHXControllerVM'
+     task_5: 'Task-SetHXControllerVMDisk'
+     task_6: 'Task-StartVM'
+     task_7: 'Task-SetVMHostnameIPAddresses'
+     task_8: 'Task-SetComputerAccounts'
+     task_9: 'Task-StopVM'
+     task_10: 'Task-SetRegistryValue'
+     task_11: 'Task-SetHyperVHostConfig'
+     task_12: 'Task-SetHighPerformancePowerState'
+     task_13: 'Task-SetConstrainedDelegation'
+     task_14: 'Task-SetHostCredSSP'
+     task_15: 'Task-SetBootstrapDone'
+
+  tasks:
+
+    - shell:
+        cmd: export NO_PROXY="{{inventory_hostname}}" && export no_proxy="{{inventory_hostname}}"
+      delegate_to: localhost
+
+    - name: Generate jsonData
+      local_action:
+        module: generate_json.py
+        nodes: "{{ hostvars[inventory_hostname] }}"
+        jsonData: "{{ jsonData }}"
+        dnsServers: "{{ hostvars[inventory_hostname]['adIp'] }}"
+        domain: "ad-{{ userId[:12] }}.local"
+
+    - name: Create install directory
+      win_file:
+        path: "{{ json_dir_remote }}"
+        state: directory
+
+    - name: Verify directory structure
+      win_file:
+          path: "{{ json_dir_remote }}"
+          state: directory
+
+    - name: Copy Virt JSON
+      win_copy:
+          content: "{{ virt_json }}"
+          dest: "{{ json_file_virtual_remote }}"
+
+    - name: Copy Network JSON
+      win_copy:
+          content: "{{ network_json }}"
+          dest: "{{ json_file_network_remote }}"
+
+    - name: Copy Core Powershell files
+      win_copy:
+        src: "{{ item.src }}"
+        dest: "{{ item.dst }}"
+      with_items:
+        - { src: "{{ json_dir_local }}/{{ bootstrap_ps_file }}", dst: "{{ json_dir_remote }}\\{{ bootstrap_ps_file }}" }
+        - { src: "{{ json_dir_local }}/{{ bootstrap_psm_file }}", dst: "{{ json_dir_remote }}\\{{ bootstrap_psm_file }}" }
+        - { src: "{{ json_dir_local }}/{{ bootstrap_xml_file }}", dst: "{{ json_dir_remote }}\\{{ bootstrap_xml_file }}" }
+        - { src: "{{ json_dir_local }}/{{ task_launch }}", dst: "{{ json_dir_remote }}\\{{ task_launch }}" }
+        - { src: "{{ json_dir_local }}/{{ task_run }}", dst: "{{ json_dir_remote }}\\{{ task_run }}" }
+        - { src: "{{ json_dir_local }}/{{ task_delete }}", dst: "{{ json_dir_remote }}\\{{ task_delete }}" }
+
+    - set_fact:
+        taskfiles:
+          - { src: "{{ json_dir_local }}/{{ task_0 }}", dst: "{{ json_dir_remote }}\\{{ task_0 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_1 }}", dst: "{{ json_dir_remote }}\\{{ task_1 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_2 }}", dst: "{{ json_dir_remote }}\\{{ task_2 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_3 }}", dst: "{{ json_dir_remote }}\\{{ task_3 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_4 }}", dst: "{{ json_dir_remote }}\\{{ task_4 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_5 }}", dst: "{{ json_dir_remote }}\\{{ task_5 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_6 }}", dst: "{{ json_dir_remote }}\\{{ task_6 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_7 }}", dst: "{{ json_dir_remote }}\\{{ task_7 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_8 }}", dst: "{{ json_dir_remote }}\\{{ task_8 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_9 }}", dst: "{{ json_dir_remote }}\\{{ task_9 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_10 }}", dst: "{{ json_dir_remote }}\\{{ task_10 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_11 }}", dst: "{{ json_dir_remote }}\\{{ task_11 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_12 }}", dst: "{{ json_dir_remote }}\\{{ task_12 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_13 }}", dst: "{{ json_dir_remote }}\\{{ task_13 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_14 }}", dst: "{{ json_dir_remote }}\\{{ task_14 }}" }
+          - { src: "{{ json_dir_local }}/{{ task_15 }}", dst: "{{ json_dir_remote }}\\{{ task_15 }}" }
+
+    - name: Copy Scheduled Tasks Powershell Scripts
+      win_copy:
+        src: "{{ item.src }}.ps1"
+        dest: "{{ item.dst }}.ps1"
+      with_items: "{{ taskfiles }}"
+
+    - name: Copy Scheduled Tasks XML Files
+      win_copy:
+        src: "{{ item.src }}.xml"
+        dest: "{{ item.dst }}.xml"
+      with_items: "{{ taskfiles }}"
+
+    - name: Verify Connection
+      wait_for_connection:
+        retries: 20
+        delay: 5
+
+- name: Playbook HyperV Hosts
+  hosts: esx
+  gather_facts: no
+
+  roles:
+     - hyperv
+
+- name: Install Packages
+  hosts: controllers
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+
+    - include: tasks/install.yml
+
+    - name: Remove older pbis package if any
+      shell: dpkg -r pbis-open-gui pbis-open-upgrade pbis-open
+      ignore_errors: true
+
+    - name: Purge older pbis package if any
+      shell: dpkg --purge pbis-open-gui pbis-open-upgrade pbis-open
+      ignore_errors: true
+
+    - name: Running hvinstall for Hyper-V Package
+      shell: /opt/springpath/storfs-hyperv/hvinstall.sh
+
+    - name: Verify lookup
+      shell: nslookup "ad-{{ userId[:12] }}.local"
+
+    - name: Get ctlvm hostname
+      shell: hostname
+      register: ctlvm_hostname
+
+    - name: Running hvinit for Hyper-V Package
+      shell: /opt/springpath/storfs-hyperv/hvinit.sh "{{ ctlvm_hostname.stdout }}" "{{ ctlvm_hostname.stdout }}d" "{{ cluster.name }}" "{{ hostvars[inventory_hostname]['adIp'] }}" "ad-{{ userId[:12] }}.local" "administrator" "Cisco123" ""
+      retries: 5
+      delay: 20
+
+    - pause:
+        seconds: 60
+
+    - name: Reboot Controller VM
+      shell: sync && reboot
+      async: 0
+      poll: 0
+
+    - name: Waiting for Controller to Restart
+      local_action:
+         module: wait_for
+             host={{ inventory_hostname }}
+             port=22
+             state=started
+             delay=60
+             timeout=1800
+
+- name: Generate Hyperv JSON Files
+  hosts: esx
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        domain: "ad-{{ userId[:12] }}.local"
+
+    - shell:
+        cmd: export NO_PROXY="{{inventory_hostname}}" && export no_proxy="{{inventory_hostname}}"
+      delegate_to: localhost
+
+    # - name: Turn off VM
+    #   win_shell: Get-VM -Name "StCtlVM" | Stop-VM -Force:$True -TurnOff:$True -ErrorAction Stop -Confirm:$False -Verbose
+    #
+    # - name: Set Dynamic memory
+    #   win_shell: Set-VMMemory -VMName "StCtlVM" -DynamicMemoryEnabled $True -MinimumBytes 4294967296 -MaximumBytes 53687091200 -Priority 100 -Confirm:$False
+    #
+    # - name: Turn on VM
+    #   win_shell: Get-VM -Name "StCtlVM" | Start-VM -ErrorAction Stop -Confirm:$False -Verbose
+    #
+
+    - name: Add hxadmin user
+      win_shell: "{{ item }}"
+      with_items:
+        - 'New-ADUser -Name hxadmin -SamAccountName hxadmin -AccountPassword (ConvertTo-SecureString -AsPlainText "Cisco123" -Force) -PassThru | Enable-ADAccount'
+        - 'Add-ADGroupMember -Identity "Domain Admins" -Members hxadmin'
+      delegate_to: "{{ hostvars[inventory_hostname]['adIp'] }}"
+      ignore_errors: true
+      run_once: true
+
+    - name: Disable expiration for hxadmin
+      win_shell: Set-LocalUser -Name "hxadmin" -PasswordNeverExpires 1
+      delegate_to: "{{ hostvars[inventory_hostname]['adIp'] }}"
+      ignore_errors: true
+      run_once: true
+
+    - name: Get Host UUID
+      win_shell: (Get-WmiObject -Class Win32_ComputerSystemProduct).uuid
+      register: hostUUID
+
+    - name: Get Host Serial
+      win_shell: (Get-WmiObject -Class Win32_BIOS).serialnumber
+      register: hostSerial
+
+    - name: Get Host Model
+      win_shell: (Get-WmiObject -Class Win32_ComputerSystem).model
+      register: hostModel
+
+    - name: Get VM ID
+      win_shell: (Get-VM StCtlVM).id | foreach { $_.Guid }
+      register: controllerVMID
+
+    - name: Get CVM UUID
+      shell: dmidecode | grep UUID | awk '{print $NF}'
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"
+      register: controllerUUID
+
+    - name: Generate jsonData
+      local_action:
+        module: generate_inventory.py
+        nodes: "{{ hostvars }}"
+        jsonData: "{{ jsonData }}"
+        dnsServers: "{{ hostvars[inventory_hostname]['adIp'] }}"
+        domain: "ad-{{ userId[:12] }}.local"
+
+    - name: Copy inventory JSON to controllers
+      copy:
+        content: " {{ inventoryJSON | to_nice_json(indent=2) }}"
+        dest: /etc/springpath/secure/hxinstall_inventory.json
+        force: yes
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"
+
+    - name: Copy auth JSON to controllers
+      copy:
+        content: " {{ authJSON | to_nice_json(indent=2) }}"
+        dest: /etc/springpath/secure/auth.json
+        force: yes
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"
+
+    - name: Create local_hypervisor file
+      lineinfile: >
+          dest="/etc/local_hypervisor" mode=0644
+          line={{ 'localhv=' + hostvars[inventory_hostname]['hyperv_hostname'] + '.' + domain }} create=yes
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"
+
+
+- name: Create Cluster
+  hosts: clusters
+  become: false
+  gather_facts: no
+  serial: 1
+
+  tasks:
+
+    - set_fact:
+        cvmList: []
+
+    - set_fact:
+        cvmList: "{{ cvmList + [ {'uuid':  hostvars[item].controllerUUID.stdout_lines[0] | lower, 'ip': hostvars[item].scvmip } ] }}"
+      with_items: "{{ groups['esx'] }}"
+
+    - set_fact:
+        domain: "ad-{{ userId[:12] }}.local"
+
+    - name: Setup payload
+      set_fact:
+        body:
+          name: "{{ hostvars[inventory_hostname]['clusterName'] }}"
+          ctlVmMgmtIpList: "{{ cvmList }}"
+          clusterMgmtIp: "{{ hostvars[inventory_hostname]['mgmtcip'] }}"
+          clusterDataIp: "{{ hostvars[inventory_hostname]['datacip'] }}"
+          size: "{{ hostvars[inventory_hostname]['nodecount'] }}"
+          dataReplicationFactor: "{{ 'TWO_COPIES' if hostvars[inventory_hostname]['nodecount'] > 1 else 'ONE_COPY' }}"
+          clusterAccessPolicy: "LENIENT"
+          workloadType: "VSI"
+          diskEncryptionCapability: "NOT_SUPPORTED"
+          zoneType: 0
+
+    - debug:
+        msg:
+          - "Hyper-V Hosts: {{ groups['esx'] | map('extract', hostvars, ['inventory_hostname']) | join(', ') }}"
+          - "Controllers: {{ groups['controllers'] | map('extract', hostvars, ['inventory_hostname']) | join(',') }}"
+          - "AD: {{ hostvars[inventory_hostname]['adIp'] }}"
+
+    - name: Create Cluster
+      uri:
+        url: "https://{{hostvars[inventory_hostname]['scvmip'] }}/coreapi/v1/clusters"
+        method: POST
+        user: "root"
+        password: "{{ jsonData.esx.password | b64decode }}"
+        body: "{{ body }}"
+        status_code: 202
+        body_format: json
+        return_content: yes
+        validate_certs: no
+        force_basic_auth: yes
+        headers:
+          Content-Type: "application/json"
+          Auth-Hv-Ad-User-Name: "{{ ('hxadmin@' + domain) | b64encode }}"
+          Auth-Hv-Ad-Password: "{{ jsonData.esx.password }}"
+          Auth-Hv-Host-User-Name: "{{ 'Administrator' | b64encode }}"
+          Auth-Hv-Host-Password: "{{ jsonData.esx.password }}"
+      register: createClusterJob
+      delegate_to: localhost
+
+    - name: Get Job Status
+      uri:
+        url: "https://{{hostvars[inventory_hostname]['scvmip'] }}/coreapi/v1/clusters/jobs/{{ createClusterJob.json.jobId }}"
+        method: GET
+        user: "root"
+        password: "{{ jsonData.esx.password | b64decode }}"
+        status_code: 200
+        validate_certs: no
+        return_content: yes
+        force_basic_auth: yes
+        headers:
+          Content-Type: "application/json"
+      register: jobStatus
+      retries: 300
+      delay: 30
+      until: jobStatus.json.state is defined and (jobStatus.json.state == 'COMPLETED' or jobStatus.json.state == 'EXCEPTION')
+      delegate_to: localhost
+      ignore_errors: true
+
+    - name: Send notification
+      slack:
+        token: T047GHA9Z/B4TV75STW/xJrMQxJkPs2UZ54tGPvo40HG
+        msg: "Job <https://tower.eng.storvisor.com/#/jobs/{{tower_job_id}}|{{tower_job_id}}> has completed \n {{ 'Cluster creation failed\n' if jobStatus.json.summaryStepState == 'FAILED' else '' }}Hyper-V: {{ groups['esx'] | map('extract', hostvars, ['inventory_hostname']) | join(', ') }} \n Controllers: {{ groups['controllers'] | map('extract', hostvars, ['inventory_hostname']) | join(',') }} \n Cluster: {{ hostvars[inventory_hostname]['clusterName'] }} - <https://{{ hostvars[inventory_hostname]['mgmtcip'] }}|{{ hostvars[inventory_hostname]['mgmtcip'] }}> \n AD: {{ hostvars[inventory_hostname]['adIp'] }}"
+        channel: "@{{ slackUsername }}"
+        color: "{{ 'danger' if jobStatus.json.summaryStepState == 'FAILED' else 'good' }}"
+        username: 'ansiblebot'
+      delegate_to: localhost
+      when: tower_job_id is defined and slackUsername is defined
+      environment:
+        http_proxy: http://proxy.esl.cisco.com:8080
+        https_proxy: http://proxy.esl.cisco.com:8080
+      ignore_errors: true
+
+    - name: Send notification
+      slack:
+        token: T047GHA9Z/B4TV75STW/xJrMQxJkPs2UZ54tGPvo40HG
+        msg: "{{ 'Cluster creation failed\n' if jobStatus.json.summaryStepState == 'FAILED' else '' }}Hyper-V: {{ groups['esx'] | map('extract', hostvars, ['inventory_hostname']) | join(', ') }} \n Controllers: {{ groups['controllers'] | map('extract', hostvars, ['inventory_hostname']) | join(',') }} \n Cluster: {{ hostvars[inventory_hostname]['clusterName'] }} - <https://{{ hostvars[inventory_hostname]['mgmtcip'] }}|{{ hostvars[inventory_hostname]['mgmtcip'] }}> \n AD: {{ hostvars[inventory_hostname]['adIp'] }}\nLogin <https://tower-vc.eng.storvisor.com/ui/}here> with CEC credentials to manage VMs"
+        channel: "@{{ slackUsername }}"
+        color: "{{ 'danger' if jobStatus.json.summaryStepState == 'FAILED' else 'good' }}"
+        username: 'ansiblebot'
+      delegate_to: localhost
+      when: tower_job_id is not defined and slackUsername is defined
+      environment:
+        http_proxy: http://proxy.esl.cisco.com:8080
+        https_proxy: http://proxy.esl.cisco.com:8080
+      ignore_errors: true
+
+    - name: Send notification
+      cisco_spark:
+        recipient_type: toPersonEmail
+        recipient_id: "{{ userId }}@cisco.com"
+        message_type: markdown
+        token: "M2MxMzg5NWEtZjAxYy00ZWU0LTg0MTAtNDA1ODI5YWNkZDVkZmM3YmVlNTAtZDQ1"
+        message: "{{ 'Cluster creation failed\n\n' if jobStatus.json.summaryStepState == 'FAILED' else '' }}**Hyper-V:** {{ groups['esx'] | map('extract', hostvars, ['inventory_hostname']) | join(', ') }} \n\n **Controllers:** {{ groups['controllers'] | map('extract', hostvars, ['inventory_hostname']) | join(',') }} \n\n **Cluster:** {{ hostvars[inventory_hostname]['clusterName'] }} - [{{ hostvars[inventory_hostname]['mgmtcip'] }}](https://{{ hostvars[inventory_hostname]['mgmtcip'] }}) \n\n **AD:** {{ hostvars[inventory_hostname]['adIp'] }}\n\n Login [here](https://tower-vc.eng.storvisor.com/ui/) with CEC credentials to manage VMs"
+      delegate_to: localhost
+      environment:
+        http_proxy: http://proxy.esl.cisco.com:8080
+        https_proxy: http://proxy.esl.cisco.com:8080
+      ignore_errors: true
+
+
+    - name: Send notification
+      slack:
+        token: T047GHA9Z/B4TV75STW/xJrMQxJkPs2UZ54tGPvo40HG
+        msg: "{{ 'Cluster creation failed\n' if jobStatus.json.summaryStepState == 'FAILED' else '' }}Hyper-V: {{ groups['esx'] | map('extract', hostvars, ['inventory_hostname']) | join(', ') }} \n Controllers: {{ groups['controllers'] | map('extract', hostvars, ['inventory_hostname']) | join(',') }} \n Cluster: {{ hostvars[inventory_hostname]['clusterName'] }} - <https://{{ hostvars[inventory_hostname]['mgmtcip'] }}|{{ hostvars[inventory_hostname]['mgmtcip'] }}> \n AD: {{ hostvars[inventory_hostname]['adIp'] }}"
+        channel: "@{{ userId }}"
+        color: "{{ 'danger' if jobStatus.json.summaryStepState == 'FAILED' else 'good' }}"
+        username: 'ansiblebot'
+      delegate_to: localhost
+      when: tower_job_id is not defined and userId is defined
+      ignore_errors: true
+
+
+    - fail:
+        msg: "Cluster creation failed"
+      when: jobStatus.json.summaryStepState == 'FAILED'
+
+
+    - name: Get Cluster UUID
+      uri:
+        url: "https://{{hostvars[inventory_hostname]['scvmip'] }}/coreapi/v1/clusters"
+        method: GET
+        user: "root"
+        password: "{{ jsonData.esx.password | b64decode }}"
+        status_code: 200
+        validate_certs: no
+        return_content: yes
+        force_basic_auth: yes
+        headers:
+          Content-Type: "application/json"
+      register: clusterOutput
+      delegate_to: localhost
+
+    - name: Get Cluster Health
+      uri:
+        url: "https://{{hostvars[inventory_hostname]['scvmip'] }}/coreapi/v1/clusters/{{ clusterOutput.json[0].uuid }}/status"
+        method: GET
+        user: "root"
+        password: "{{ jsonData.esx.password | b64decode }}"
+        status_code: 200
+        validate_certs: no
+        return_content: yes
+        force_basic_auth: yes
+        headers:
+          Content-Type: "application/json"
+      register: healthOutput
+      delegate_to: localhost

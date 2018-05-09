@@ -1,0 +1,130 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: no
+
+  tasks:
+    - include: tasks/init.yml
+
+- name: Deploy ESX Template
+  hosts: esx
+  become: true
+  gather_facts: no
+
+  tasks:
+    - include: tasks/esx.yml
+
+- name: Install Packages
+  hosts: controllers
+  become: true
+  gather_facts: no
+
+  tasks:
+    - set_fact:
+        clusterCreate: "{{ jsonData.createCluster | bool }}"
+        node_ips: "{{ groups['esx'] | join(' ') }}"
+        allFlash: "{{ jsonData.allFlash | bool }}"
+
+    - include: tasks/install.yml
+
+    - name: Create VC datacenter
+      local_action:
+        module: vmware_datacenter
+        hostname: "{{ jsonData.vcenter.host }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ jsonData.cluster.datacenter }}"
+        state: present
+        validate_certs: false
+      run_once: true
+
+    - name: Remove VC cluster
+      local_action:
+        module: vmware_cluster
+        hostname: "{{ jsonData.vcenter.host }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ jsonData.cluster.datacenter }}"
+        cluster_name: "{{ jsonData.cluster.cluster }}"
+        state: absent
+        validate_certs: false
+      run_once: true
+
+    - name: Create VC cluster
+      local_action:
+        module: vmware_cluster
+        hostname: "{{ jsonData.vcenter.host }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ jsonData.cluster.datacenter }}"
+        cluster_name: "{{ jsonData.cluster.cluster }}"
+        state: present
+        validate_certs: false
+      run_once: true
+
+    - name: Add host to VC
+      local_action:
+        module: vmware_host
+        hostname: "{{ jsonData.vcenter.host }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ jsonData.cluster.datacenter }}"
+        cluster_name: "{{ jsonData.cluster.cluster }}"
+        esxi_hostname: "{{ hostvars[inventory_hostname]['esx_host'] }}"
+        esxi_username: "{{ jsonData.esx.user }}"
+        esxi_password: "{{ jsonData.esx.password | b64decode }}"
+        state: present
+        validate_certs: false
+
+    - name: Waiting for Controller to Restart
+      local_action:
+         module: wait_for
+             host={{ inventory_hostname }}
+             port=22
+             state=started
+             delay=30
+             timeout=1800
+
+    - name: Validating Cluster Services Available
+      command: echo srvr | nc localhost 2181
+      register: ret
+      until: ret.rc == 0
+      retries: 15
+      delay: 20
+
+    - name: Validating Software Services
+      command: stcli about
+      register: ret
+      until: ret.rc == 0
+      retries: 4
+      delay: 20
+
+    - name: Reconfiguring Storage Controller NTP Server List
+      shell: stcli services ntp set --ntp {{ jsonData.ntp }}
+      when: "{{ jsonData.ntp | length > 0 }}"
+
+
+- name: Create Cluster
+  hosts: controllers[0]
+  become: true
+  gather_facts: no
+
+  tasks:
+
+    - set_fact:
+        clusterCreate: "{{ jsonData.createCluster | bool }}"
+        node_ips: "{{ groups['esx'] | join(' ') }}"
+
+
+    - name: Create cluster
+      shell: stcli cluster create --name {{ jsonData.cluster.cluster }} --ip {{ jsonData.cluster.dataIp }} --mgmt-ip {{ jsonData.cluster.mgmtIp }} --vcenter-datacenter {{ jsonData.cluster.datacenter }} --vcenter-cluster {{ jsonData.cluster.cluster }} --vcenter-url {{ jsonData.vcenter.host }} --vcenter-password '{{ jsonData.vcenter.password }}' --controller-root-password {{ jsonData.esx.password | b64decode }} --data-replication-factor 2 --node-ips {{ node_ips }} --esx-username {{ jsonData.esx.user }} --esx-password {{ jsonData.esx.password | b64decode }} --accept-eula --vcenter-user {{ jsonData.vcenter.user }} -f
+      async: 1800
+      poll: 60
+      when: clusterCreate == true
+      ignore_errors: yes
+
+    - debug:
+        msg: stcli cluster create --name {{ jsonData.cluster.cluster }} --ip {{ jsonData.cluster.dataIp }} --mgmt-ip {{ jsonData.cluster.mgmtIp }} --vcenter-datacenter {{ jsonData.cluster.datacenter }} --vcenter-cluster {{ jsonData.cluster.cluster }} --vcenter-url {{ jsonData.vcenter.host }} --vcenter-password '{{ jsonData.vcenter.password }}' --controller-root-password {{ jsonData.esx.password | b64decode }} --data-replication-factor 2 --node-ips {{ node_ips }} --esx-username {{ jsonData.esx.user }} --esx-password {{ jsonData.esx.password | b64decode }} --accept-eula --vcenter-user {{ jsonData.vcenter.user }} -f

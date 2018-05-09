@@ -1,0 +1,310 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        esx_template_location: "{{ template_map[buildInfo.esx] }}"
+        vcsa_template_location: "{{ template_map[buildInfo.vcsa] }}"
+        vcsa_template_prefix: "{{ template_map[buildInfo.vcsa].split('/')[4] }}"
+        esx_template_prefix: "{{ template_map[buildInfo.esx].split('/')[4] }}"
+        controller_template_prefix: "{{ template_map[buildInfo.scvm].split('/')[4] }}"
+        replRoleType: "{{ cluster.replRoleType | default(omit, True) | lower }}"
+
+    - name: Set Template Name
+      set_fact:
+        template_name: "{{ jsonData.deploy.vcCluster }}-{{ esx_template_prefix }}"
+        vcsa_template: "{{ jsonData.deploy.vcCluster }}-{{ vcsa_template_prefix }}-source"
+        cvm_template: "{{ jsonData.deploy.vcCluster }}-{{ controller_template_prefix }}-controller"
+        vcsa_name: "{{ vcsa_template_prefix }}-{{ userId }}-{{ jsonData.deploy.vmPrefix }}-source"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) }}"
+
+    - set_fact:
+        vcsa_name: "{{ vcsa_template_prefix }}-{{ userId }}-{{ jsonData.deploy.vmPrefix }}-source"
+      when: replRoleType is defined and replRoleType == 'source'
+
+    - set_fact:
+        vcsa_name: "{{ vcsa_template_prefix }}-{{ userId }}-{{ jsonData.deploy.vmPrefix }}-target"
+      when: replRoleType is defined and replRoleType == 'target'
+
+    - name: Get Build Info
+      local_action:
+        module: getbuild.py
+        url: "{{ buildUrl }}"
+
+    - name: Get IP Information
+      local_action:
+        module: reserve.py
+        clusterInfo: "{{ cluster }}"
+        jsonData: "{{ jsonData }}"
+        release: "2.5.1a"
+        userId: "{{ userId }}"
+
+    - name: Get VCSA IP
+      local_action:
+        module: reserve.py
+        jsonData: "{{ jsonData }}"
+        node: "{{ vcsa_name }}"
+
+    - name: extract esx host info
+      add_host: name={{ item.hypervisorMgmt }} group=esx
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esxip={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                scvmdataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: extract controller info
+      add_host: name={{ item.controllerMgmt }} group=controllers
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esx_host={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                dataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+                replip={{ item.controllerRepl }}
+                replcip={{ item.replcip }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: extract cluster info
+      add_host: name={{ item.mgmtcip }} group=clusters
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esx_host={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                dataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+                vcsaIp={{ vcsaIp | default(jsonData.vcenter.host) }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+
+- name: Configure ESX
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        vm_name: "{{ jsonData.deploy.vmPrefix }}-{{ userId }}-{{ hostvars[inventory_hostname]['clusterName'] }}-{{ inventory_hostname }}"
+        cvm_name: "stCtlVM-{{ userId }}-{{ inventory_hostname }}"
+        template_name: "{{ jsonData.deploy.vcCluster }}-{{ template_map[buildInfo.esx].split('/')[4] }}"
+        cvm_template: "{{ jsonData.deploy.vcCluster }}-{{ template_map[buildInfo.scvm].split('/')[4] }}-controller"
+        storfsRelease: "{{ hostvars[inventory_hostname]['storfsRelease'] }}"
+        storfsBuild: "{{ hostvars[inventory_hostname]['storfsBuild'] }}"
+        replRoleType: "{{ cluster.replRoleType | default(omit) }}"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) | regex_replace('latest', storfsBuild) }}"
+
+    - name: Waiting for ESXi Host To Start
+      local_action:
+         module: wait_for
+             host={{ inventory_hostname }}
+             port=22
+             state=started
+             delay=30
+             timeout=3600
+
+    - name: Waiting for ESXi System Services To Be Ready
+      shell: esxcli system uuid get
+      register: systemUuid
+      until: systemUuid.rc == 0
+      retries: 50
+      delay: 10
+
+    - name: Get Datastore name
+      shell: ls -1d /vmfs/volumes/snap* | awk -F/ '{print $4'}
+      register: ds_name
+
+    - name: Get Datastore name
+      shell: ls -1d /vmfs/volumes/SpringpathDS* | awk -F/ '{print $4'}
+      register: datastore_name
+
+    - set_fact:
+        datastore: "{{ ds_name.stdout }}"
+      when: ds_name is defined and ds_name.stdout != ''
+
+    - set_fact:
+        datastore: "{{ datastore_name.stdout }}"
+      when: datastore_name is defined and datastore_name.stdout != ''
+
+    - name: Install VIBs
+      shell: wget -P /vmfs/volumes/{{ datastore }} {{ buildUrl}}/package/springpath-bundle.zip && esxcli software vib install -d /vmfs/volumes/{{ datastore }}/springpath-bundle.zip -f && rm -f /vmfs/volumes/{{ datastore }}/springpath-bundle.zip
+      register: installvibout
+      #failed_when: '"Operation finished successfully" not in installvibout.stdout'
+
+    - name: Check stHypervisorSvc status
+      shell: /etc/init.d/stHypervisorSvc status
+      register: stHypervisorSvc
+      ignore_errors: true
+
+    - name: Start stHypervisorSvc
+      fail: msg="stHypervisorSvc not running"
+      when: '"not running" in stHypervisorSvc.stdout'
+
+    # bug 22933
+    - name: Remove snapshot consolidation
+      lineinfile: dest=/etc/vmware/config
+                  line='snapshot.asyncConsolidate = \"FALSE\"'
+                  state=absent
+      when: storfsRelease | version_compare('2.5.1a', '>=')
+
+
+- name: Install Packages
+  hosts: controllers
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+    - include: tasks/install.yml
+
+
+- name: Create Cluster
+  hosts: clusters
+  become: false
+  gather_facts: no
+  serial: 1
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        node_ips: []
+        cvm_ips: []
+        repl_ips: []
+        replRoleType: "{{ cluster.replRoleType | default(omit, True) }}"
+
+    - set_fact:
+        node_ips: "{{ node_ips }} + [ '{{ hostvars[item].esx_host }}' ]"
+        cvm_ips: "{{ cvm_ips }} + [ '{{ hostvars[item].scvmip }}' ]"
+      with_items: "{{ groups['controllers'] }}"
+      when: hostvars[item].mgmtcip == inventory_hostname
+
+    - set_fact:
+        repl_ips: "{{ repl_ips }} + [ '{{ hostvars[item].replip }}' ]"
+      with_items: "{{ groups['controllers'] }}"
+      when: hostvars[item].mgmtcip == inventory_hostname and replRoleType is defined
+
+    - set_fact:
+        repl_ips: "{{ repl_ips }} + [ '{{ hostvars[item].replcip }}' ]"
+      with_items: "{{ groups['controllers'] }}"
+      when: replRoleType is defined
+
+    - name: Create VC datacenter
+      local_action:
+        module: vmware_datacenter
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "stcli-virt-cit-dc"
+        state: present
+        validate_certs: false
+      register: ret
+      until: ret | success
+      retries: 50
+      delay: 60
+
+    - name: Create VC cluster
+      local_action:
+        module: vmware_cluster
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "stcli-virt-cit-dc"
+        cluster_name: "stcli_cit_virt_cluster"
+        state: present
+        validate_certs: false
+
+    - name: Add host to VC
+      local_action:
+        module: vmware_host
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "stcli-virt-cit-dc"
+        cluster_name: "stcli_cit_virt_cluster"
+        esxi_hostname: "{{ item }}"
+        esxi_username: "{{ jsonData.esx.user }}"
+        esxi_password: "{{ jsonData.esx.password | b64decode }}"
+        state: present
+        validate_certs: false
+      with_items: "{{ node_ips }}"
+      register: ret
+      async: 7200
+      poll: 0
+      until: ret | success
+
+
+    - name: Wait for hosts to be added
+      async_status: jid={{ item.ansible_job_id }}
+      register: host_jobs
+      until: host_jobs.finished
+      retries: 20
+      with_items: "{{ ret.results }}"
+      ignore_errors: true
+      delegate_to: localhost
+
+    - debug:
+        msg: stcli cluster create --name {{ hostvars[inventory_hostname]['clusterName'] }}  --ip {{ hostvars[inventory_hostname]['datacip'] }} --mgmt-ip {{ hostvars[inventory_hostname]['mgmtcip'] }} --vcenter-datacenter stcli-virt-cit-dc  --vcenter-cluster stcli_cit_virt_cluster  --vcenter-url {{ hostvars[inventory_hostname]['vcsaIp'] }} --vcenter-password '{{ jsonData.vcenter.password }}' --controller-root-password {{ jsonData.esx.password | b64decode }} --data-replication-factor {{ cluster.replicationFactor }} --node-ips {{ node_ips | join(' ') }} --esx-username {{ jsonData.esx.user }} --esx-password {{ jsonData.esx.password | b64decode }} --accept-eula --vcenter-user {{ jsonData.vcenter.user }} {{ '-f' if node_ips | length < 2 else ''}} --cluster-access-policy lenient
+
+    - debug:
+        msg:
+          - "ESX: {{ node_ips | join(' ') }}"
+          - "Controllers: {{ cvm_ips | join(' ') }}"
+          - "Repl IPs: {{ repl_ips | unique | join(' ') }}"
+          - "vCenter: {{ hostvars[inventory_hostname]['vcsaIp'] }}"
+
+    - name: Create cluster
+      shell: stcli cluster create --name {{ hostvars[inventory_hostname]['clusterName'] }}  --ip {{ hostvars[inventory_hostname]['datacip'] }} --mgmt-ip {{ hostvars[inventory_hostname]['mgmtcip'] }} --vcenter-datacenter stcli-virt-cit-dc  --vcenter-cluster stcli_cit_virt_cluster  --vcenter-url {{ hostvars[inventory_hostname]['vcsaIp'] }} --vcenter-password '{{ jsonData.vcenter.password }}' --controller-root-password {{ jsonData.esx.password | b64decode }} --data-replication-factor {{ cluster.replicationFactor }} --node-ips {{ node_ips | join(' ') }} --esx-username {{ jsonData.esx.user }} --esx-password {{ jsonData.esx.password | b64decode }} --accept-eula --vcenter-user {{ jsonData.vcenter.user }} {{ '-f' if node_ips | length < 2 else ''}} --cluster-access-policy lenient
+      async: 1800
+      poll: 30
+      when: clusterCreate == true
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"
+      register: ret
+      ignore_errors: true
+
+    - name: Retry create cluster
+      shell: stcli cluster create --name {{ hostvars[inventory_hostname]['clusterName'] }}  --ip {{ hostvars[inventory_hostname]['datacip'] }} --mgmt-ip {{ hostvars[inventory_hostname]['mgmtcip'] }} --vcenter-datacenter stcli-virt-cit-dc  --vcenter-cluster stcli_cit_virt_cluster  --vcenter-url {{ hostvars[inventory_hostname]['vcsaIp'] }} --vcenter-password '{{ jsonData.vcenter.password }}' --controller-root-password {{ jsonData.esx.password | b64decode }} --data-replication-factor {{ cluster.replicationFactor }} --node-ips {{ node_ips | join(' ') }} --esx-username {{ jsonData.esx.user }} --esx-password {{ jsonData.esx.password | b64decode }} --accept-eula --vcenter-user {{ jsonData.vcenter.user }} {{ '-f' if node_ips | length < 2 else ''}} --cluster-access-policy lenient
+      async: 1800
+      poll: 30
+      when: clusterCreate == true and ret | failed
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"

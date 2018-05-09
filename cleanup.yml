@@ -1,0 +1,36 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    ansible_ssh_user: "{{ jsonData.deploy.user }}"
+    ansible_ssh_pass: "{{ jsonData.deploy.password | b64decode }}"
+
+  tasks:
+
+    - name: Finding deployed VMs
+      local_action:
+        module: vmware_vm_facts
+        hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+      register: all_vms_base
+
+    - name: Delete VCSA
+      local_action:
+        module: vsphere_guest
+        vcenter_hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+        guest: "{{ item }}"
+        state: absent
+        force: yes
+      with_items:
+          - "{{ all_vms_base['virtual_machines'].keys() }}"
+      when: userId in item

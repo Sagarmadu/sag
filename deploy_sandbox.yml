@@ -1,0 +1,114 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    ansible_ssh_user: "{{ jsonData.deploy.user }}"
+    ansible_ssh_pass: "{{ jsonData.deploy.password | b64decode }}"
+
+  tasks:
+    - include: tasks/init.yml
+
+- name: Deploy ESX Template
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+    - include: tasks/esx.yml
+
+- name: Install Packages
+  hosts: controllers
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+    - include: tasks/install.yml
+
+- name: Create Cluster
+  hosts: clusters
+  become: false
+  gather_facts: no
+  serial: 1
+
+  tasks:
+
+    - set_fact:
+        node_ips: []
+        cvm_ips: []
+        repl_ips: []
+        replRoleType: "{{ cluster.replRoleType | default(omit, True) }}"
+
+    - set_fact:
+        node_ips: "{{ node_ips }} + [ '{{ hostvars[item].esx_host }}' ]"
+        cvm_ips: "{{ cvm_ips }} + [ '{{ hostvars[item].scvmip }}' ]"
+      with_items: "{{ groups['controllers'] }}"
+      when: hostvars[item].mgmtcip == inventory_hostname
+
+    - set_fact:
+        repl_ips: "{{ repl_ips }} + [ '{{ hostvars[item].replip }}' ]"
+      with_items: "{{ groups['controllers'] }}"
+      when: hostvars[item].mgmtcip == inventory_hostname and replRoleType is defined
+
+    - set_fact:
+        repl_ips: "{{ repl_ips }} + [ '{{ hostvars[item].replcip }}' ]"
+      with_items: "{{ groups['controllers'] }}"
+      when: replRoleType is defined
+
+    - name: Create VC datacenter
+      local_action:
+        module: vmware_datacenter
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "stcli-virt-cit-dc"
+        state: present
+        validate_certs: false
+
+
+    - name: Create VC cluster
+      local_action:
+        module: vmware_cluster
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "stcli-virt-cit-dc"
+        cluster_name: "stcli_cit_virt_cluster"
+        state: present
+        validate_certs: false
+
+    - name: Add host to VC
+      local_action:
+        module: vmware_host
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "stcli-virt-cit-dc"
+        cluster_name: "stcli_cit_virt_cluster"
+        esxi_hostname: "{{ item }}"
+        esxi_username: "{{ jsonData.esx.user }}"
+        esxi_password: "{{ jsonData.esx.password | b64decode }}"
+        state: present
+        validate_certs: false
+      with_items: "{{ node_ips }}"
+      async: 7200
+      poll: 0
+
+    - debug:
+        msg: stcli cluster create --name {{ hostvars[inventory_hostname]['clusterName'] }}  --ip {{ hostvars[inventory_hostname]['datacip'] }} --mgmt-ip {{ hostvars[inventory_hostname]['mgmtcip'] }} --vcenter-datacenter {{ hostvars[inventory_hostname]['datacenter'] }}  --vcenter-cluster {{ hostvars[inventory_hostname]['clusterName'] }}  --vcenter-url {{ hostvars[inventory_hostname]['vcsaIp'] }} --vcenter-password '{{ jsonData.vcenter.password }}' --controller-root-password {{ jsonData.esx.password | b64decode }} --data-replication-factor {{ cluster.replicationFactor }} --node-ips {{ node_ips | join(' ') }} --esx-username {{ jsonData.esx.user }} --esx-password {{ jsonData.esx.password | b64decode }} --accept-eula --vcenter-user {{ jsonData.vcenter.user }} -f
+
+    - debug:
+        msg:
+          - "ESX: {{ node_ips | join(' ') }}"
+          - "Controllers: {{ cvm_ips | join(' ') }}"
+          - "Repl IPs: {{ repl_ips | unique | join(' ') }}"
+          - "vCenter: {{ hostvars[inventory_hostname]['vcsaIp'] }}"
+

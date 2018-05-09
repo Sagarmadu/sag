@@ -1,0 +1,83 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        pairingInfo: "{{ lookup('file', '/opt/sysmgmt/testbeds/sandbox/pair.yml') | from_yaml }}"
+
+    - name: extract controller info
+      add_host: name={{ item }} group=controllers
+                ansible_user="root"
+                ansible_ssh_pass="Cisco123"
+                ansible_pass="Cisco123"
+      with_items:
+          - "{{ pairingInfo[pair].srcMgmtIp }}"
+          - "{{ pairingInfo[pair].destMgmtIp }}"
+
+    - name: extract esx info
+      add_host: name={{ item }} group=esx
+                ansible_user="root"
+                ansible_ssh_pass="Cisco123"
+                ansible_pass="Cisco123"
+      with_items:
+          - "{{ pairingInfo[pair].srcEsx }}"
+          - "{{ pairingInfo[pair].destEsx }}"
+
+    - file:
+        path: /mnt/support/{{ buildID }}
+        state: directory
+        mode: 0755
+
+    - local_action:
+        module: copy
+        src: /tmp/stDataSvcMgrTest.log
+        dest: /mnt/support/{{ buildID }}
+        remote_src: True
+      ignore_errors: true
+
+- name: Get ESX Logs
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - shell: vm-support -e Springpath:Springpath -w /tmp
+
+    - shell: find /tmp -maxdepth 1 -type f -name esx*
+      register: esx_support_bundles
+
+    - fetch:
+        src: "{{ item }}"
+        dest: /mnt/support/{{ buildID }}/{{ item | basename }}
+      with_items:
+        - "{{ esx_support_bundles.stdout_lines }}"
+
+
+- name: Get Controller Logs
+  hosts: controllers
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+    - shell: storfs-support
+
+    - shell: find /var/support/ -maxdepth 1 -type f -name storfs-support*
+      register: cvm_support_bundles
+
+    - fetch:
+        src: "{{ item }}"
+        dest: /mnt/support/{{ buildID }}/{{ item | basename }}
+        flat: yes
+      with_items:
+        - "{{ cvm_support_bundles.stdout_lines }}"
+

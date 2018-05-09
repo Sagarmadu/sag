@@ -1,0 +1,23 @@
+Ansible script to deploy a single node HX cluster with nested ESX
+
+Wiki:
+http://wiki.eng.storvisor.com/?n=Sudarsan.VirtualSingleNodeHXCluster
+
+Pre-reqs:
+Docker - apt-get install docker-engine
+
+Usage:
+Run runsim.sh to start docker container
+Edit files/simulator.json
+ansible-playbook deploy_single_node.yml
+
+To use a different JSON file:
+ansible-playbook -e "config_file=files/8_node_cluster.json" deploy_multi_node.yml
+
+Inputs:
+template section to specify URLs for templates to deploy
+deploy section is the information for the physical ESX cluster you want to deploy to
+esx section is credentials for nested ESX
+nodes section is IP information for nested ESX and controller VM.  Data IP's can be any random private IP for single node clusters
+Can specify multiple single node clusters to be created
+vcenter section is the VC where nested servers should be registered to

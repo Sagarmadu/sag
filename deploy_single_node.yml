@@ -1,0 +1,118 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: true
+  gather_facts: no
+
+  tasks:
+    - include: tasks/init.yml
+
+
+- name: Deploy ESX Template
+  hosts: esx
+  become: true
+  gather_facts: no
+
+  tasks:
+    - include: tasks/esx.yml
+
+- name: Install Packages
+  hosts: controllers
+  become: true
+  gather_facts: no
+
+  tasks:
+
+    - set_fact:
+        clusterCreate: "{{ jsonData.createCluster | bool }}"
+        allFlash: "{{ jsonData.allFlash | bool }}"
+
+    - include: tasks/install.yml
+
+    - debug:
+        msg: "{{ hostvars[inventory_hostname]['datacenter'] }}"
+
+    - name: Create VC datacenter
+      local_action:
+        module: vmware_datacenter
+        hostname: "{{ jsonData.vcenter.host }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ hostvars[inventory_hostname]['datacenter'] }}"
+        state: present
+        validate_certs: false
+
+    - name: Remove VC cluster
+      local_action:
+        module: vmware_cluster
+        hostname: "{{ jsonData.vcenter.host }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ hostvars[inventory_hostname]['datacenter'] }}"
+        cluster_name: "{{ hostvars[inventory_hostname]['cluster'] }}"
+        state: absent
+        validate_certs: false
+
+    - name: Create VC cluster
+      local_action:
+        module: vmware_cluster
+        hostname: "{{ jsonData.vcenter.host }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ hostvars[inventory_hostname]['datacenter'] }}"
+        cluster_name: "{{ hostvars[inventory_hostname]['cluster'] }}"
+        state: present
+        validate_certs: false
+
+    - name: Add host to VC
+      local_action:
+        module: vmware_host
+        hostname: "{{ jsonData.vcenter.host }}"
+        username: "{{ jsonData.vcenter.user }}"
+        password: "{{ jsonData.vcenter.password }}"
+        datacenter_name: "{{ hostvars[inventory_hostname]['datacenter'] }}"
+        cluster_name: "{{ hostvars[inventory_hostname]['cluster'] }}"
+        esxi_hostname: "{{ hostvars[inventory_hostname]['esx_host'] }}"
+        esxi_username: "{{ jsonData.esx.user }}"
+        esxi_password: "{{ jsonData.esx.password | b64decode }}"
+        state: present
+        validate_certs: false
+
+    - name: Waiting for Controller to Restart
+      local_action:
+         module: wait_for
+             host={{ inventory_hostname }}
+             port=22
+             state=started
+             delay=30
+             timeout=1800
+
+    - name: Validating Cluster Services Available
+      command: echo srvr | nc localhost 2181
+      register: ret
+      until: ret.rc == 0
+      retries: 15
+      delay: 20
+
+    - name: Validating Software Services
+      command: stcli about
+      register: ret
+      until: ret.rc == 0
+      retries: 4
+      delay: 20
+
+    - name: Reconfiguring Storage Controller NTP Server List
+      shell: stcli services ntp set --ntp {{ jsonData.ntp }}
+      when: "{{ jsonData.ntp | length > 0 }}"
+
+    - name: Create cluster
+      shell: stcli cluster create --name {{ hostvars[inventory_hostname]['cluster'] }} --ip {{ hostvars[inventory_hostname]['dataip'] }} --mgmt-ip {{ inventory_hostname }} --vcenter-datacenter {{ hostvars[inventory_hostname]['datacenter'] }} --vcenter-cluster {{ hostvars[inventory_hostname]['cluster'] }} --vcenter-url {{ jsonData.vcenter.host }} --vcenter-password '{{ jsonData.vcenter.password }}' --controller-root-password {{ jsonData.esx.password | b64decode }} --data-replication-factor 2 --node-ips {{ hostvars[inventory_hostname]['esx_host'] }} --esx-username {{ jsonData.esx.user }} --esx-password {{ jsonData.esx.password | b64decode }} --accept-eula --vcenter-user {{ jsonData.vcenter.user }} -f
+      async: 1800
+      poll: 60
+      when: clusterCreate == true
+      ignore_errors: yes
+
+    - debug:
+        msg: stcli cluster create --name {{ hostvars[inventory_hostname]['cluster'] }} --ip {{ hostvars[inventory_hostname]['dataip'] }} --mgmt-ip {{ inventory_hostname }} --vcenter-datacenter {{ hostvars[inventory_hostname]['datacenter'] }} --vcenter-cluster {{ hostvars[inventory_hostname]['cluster'] }} --vcenter-url {{ jsonData.vcenter.host }} --vcenter-password '{{ jsonData.vcenter.password }}' --controller-root-password {{ jsonData.esx.password | b64decode }} --data-replication-factor 2 --node-ips {{ hostvars[inventory_hostname]['esx_host'] }} --esx-username {{ jsonData.esx.user }} --esx-password {{ jsonData.esx.password | b64decode }} --accept-eula --vcenter-user {{ jsonData.vcenter.user }} -f

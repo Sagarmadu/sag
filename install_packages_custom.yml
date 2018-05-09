@@ -1,0 +1,223 @@
+
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        jsonData: "{{ lookup('file', testbed) | from_json }}"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) }}"
+
+    - name: Get Build Info
+      local_action:
+        module: getbuild.py
+        url: "{{ buildUrl }}"
+
+    - name: extract esx host info
+      add_host: name={{ item }} group=esx
+                ansible_user={{ jsonData.esx_username }}
+                ansible_ssh_pass={{ jsonData.esx_password }}
+                ansible_pass={{ jsonData.esx_password }}
+                esxip={{ item }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+      with_items:
+          - "{{ jsonData.esx_hosts }}"
+
+    - name: extract controller info
+      add_host: name={{ item }} group=controllers
+                ansible_user={{ jsonData.stctlvm_username }}
+                ansible_ssh_pass={{ jsonData.stctlvm_password }}
+                ansible_pass={{ jsonData.stctlvm_password }}
+                scvmip={{ item }}
+                datacip={{ jsonData.cluster_ip }}
+                clusterName={{ jsonData.testbed_name }}
+                mgmtcip={{ jsonData.mgmt_ip }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                vcsaIp={{ jsonData.vc_server }}
+                package={{ package }}
+                nodecount={{ jsonData.stctl_vms | length }}
+      with_items:
+          - "{{ jsonData.stctl_vms }}"
+
+    - name: extract cluster info
+      add_host: name={{ item }} group=clusters
+                ansible_user={{ jsonData.stctlvm_username }}
+                ansible_ssh_pass={{ jsonData.stctlvm_password }}
+                ansible_pass={{ jsonData.stctlvm_password }}
+                scvmip={{ item }}
+                datacip={{ jsonData.cluster_ip }}
+                clusterName={{ jsonData.testbed_name }}
+                mgmtcip={{ jsonData.mgmt_ip }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                vcsaIp={{ jsonData.vc_server }}
+                package={{ package }}
+                nodecount={{ jsonData.stctl_vms | length }}
+      with_items:
+          - "{{ jsonData.stctl_vms }}"
+
+
+- name: Configure ESX
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        storfsRelease: "{{ hostvars[inventory_hostname]['storfsRelease'] }}"
+        storfsBuild: "{{ hostvars[inventory_hostname]['storfsBuild'] }}"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) }}"
+
+    - name: Waiting for ESXi System Services To Be Ready
+      shell: esxcli system uuid get
+      register: systemUuid
+      until: systemUuid.rc == 0
+      retries: 50
+      delay: 10
+
+    - name: Get Datastore name
+      shell: ls -1d /vmfs/volumes/snap* | awk -F/ '{print $4'}
+      register: ds_name
+
+    - name: Get Datastore name
+      shell: ls -1d /vmfs/volumes/SpringpathDS* | awk -F/ '{print $4'}
+      register: datastore_name
+
+    - set_fact:
+        datastore: "{{ ds_name.stdout }}"
+      when: ds_name is defined and ds_name.stdout != ''
+
+    - set_fact:
+        datastore: "{{ datastore_name.stdout }}"
+      when: datastore_name is defined and datastore_name.stdout != ''
+
+    - name: Install VIBs
+      shell: wget -P /vmfs/volumes/{{ datastore }} {{ buildUrl}}/package/springpath-bundle.zip; esxcli software vib install -d /vmfs/volumes/{{ datastore }}/springpath-bundle.zip -f; rm -f /vmfs/volumes/{{ datastore }}/springpath-bundle.zip
+      failed_when: False
+      register: installvibout
+
+    # bug 22933
+    - name: Remove snapshot consolidation
+      lineinfile: dest=/etc/vmware/config
+                  line='snapshot.asyncConsolidate = \"FALSE\"'
+                  state=absent
+      when: storfsRelease | version_compare('2.5.1a', '>=')
+
+- name: Install Packages
+  hosts: controllers
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    jsonData:
+      ntp: [10.64.1.48]
+
+  tasks:
+    - include: tasks/install.yml
+
+
+- name: Create Cluster
+  hosts: clusters[0]
+  become: false
+  gather_facts: no
+  serial: 1
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        node_ips: "{{ groups['esx'] }}"
+        jsonData: "{{ lookup('file', testbed) | from_json }}"
+
+
+    - name: Remove VC datacenter
+      local_action:
+        module: vmware_datacenter
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vc_username }}"
+        password: "{{ jsonData.vc_password }}"
+        datacenter_name: "stcli-virt-cit-dc"
+        state: absent
+        validate_certs: false
+      register: ret
+      until: ret | success
+      retries: 50
+      delay: 60
+
+    - name: Clean VC Extensions
+      local_action: script library/cleanVcExtensions.py --username {{ jsonData.vc_username }} --password {{ jsonData.vc_password }} {{ hostvars[inventory_hostname]['vcsaIp'] }}
+
+    - name: Create VC datacenter
+      local_action:
+        module: vmware_datacenter
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vc_username }}"
+        password: "{{ jsonData.vc_password }}"
+        datacenter_name: "stcli-virt-cit-dc"
+        state: present
+        validate_certs: false
+      register: ret
+      until: ret | success
+      retries: 50
+      delay: 60
+
+    - name: Create VC cluster
+      local_action:
+        module: vmware_cluster
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vc_username }}"
+        password: "{{ jsonData.vc_password }}"
+        datacenter_name: "stcli-virt-cit-dc"
+        cluster_name: "stcli_cit_virt_cluster"
+        state: present
+        validate_certs: false
+
+    - name: Add host to VC
+      local_action:
+        module: vmware_host
+        hostname: "{{ hostvars[inventory_hostname]['vcsaIp'] }}"
+        username: "{{ jsonData.vc_username }}"
+        password: "{{ jsonData.vc_password }}"
+        datacenter_name: "stcli-virt-cit-dc"
+        cluster_name: "stcli_cit_virt_cluster"
+        esxi_hostname: "{{ item }}"
+        esxi_username: "{{ jsonData.esx_username }}"
+        esxi_password: "{{ jsonData.esx_password }}"
+        state: present
+        validate_certs: false
+      with_items: "{{ node_ips }}"
+      register: ret
+      async: 7200
+      poll: 0
+      until: ret | success
+
+    - name: Wait for hosts to be added
+      async_status: jid={{ item.ansible_job_id }}
+      register: host_jobs
+      until: host_jobs.finished
+      retries: 20
+      with_items: "{{ ret.results }}"
+      ignore_errors: true
+      delegate_to: localhost
+      run_once: true
+
+    - debug:
+        msg: stcli cluster create --name {{ hostvars[inventory_hostname]['clusterName'] }}  --ip {{ hostvars[inventory_hostname]['datacip'] }} --mgmt-ip {{ hostvars[inventory_hostname]['mgmtcip'] }} --vcenter-datacenter stcli-virt-cit-dc  --vcenter-cluster stcli_cit_virt_cluster  --vcenter-url {{ hostvars[inventory_hostname]['vcsaIp'] }} --vcenter-password '{{ jsonData.vc_password }}' --controller-root-password {{ jsonData.esx_password }} --data-replication-factor 3 --node-ips {{ node_ips | join(' ') }} --esx-username {{ jsonData.esx_username }} --esx-password {{ jsonData.esx_password }} --accept-eula --vcenter-user {{ jsonData.vc_username }}
+
+    - name: Create cluster
+      shell: stcli cluster create --name {{ hostvars[inventory_hostname]['clusterName'] }}  --ip {{ hostvars[inventory_hostname]['datacip'] }} --mgmt-ip {{ hostvars[inventory_hostname]['mgmtcip'] }} --vcenter-datacenter stcli-virt-cit-dc  --vcenter-cluster stcli_cit_virt_cluster  --vcenter-url {{ hostvars[inventory_hostname]['vcsaIp'] }} --vcenter-password '{{ jsonData.vc_password }}' --controller-root-password {{ jsonData.esx_password }} --data-replication-factor 3 --node-ips {{ node_ips | join(' ') }} --esx-username {{ jsonData.esx_username }} --esx-password {{ jsonData.esx_password }} --accept-eula --vcenter-user {{ jsonData.vc_username }}
+      async: 1800
+      poll: 60
+      when: clusterCreate == true
+      delegate_to: "{{ hostvars[inventory_hostname]['scvmip'] }}"

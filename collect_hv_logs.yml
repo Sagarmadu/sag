@@ -1,0 +1,50 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+    - include: tasks/init-ad.yml
+
+# - name: Get ESX Logs
+#   hosts: esx
+#   become: false
+#   gather_facts: no
+#   any_errors_fatal: true
+#
+#   tasks:
+#
+#     - shell: vm-support -e Springpath:Springpath -w /tmp
+#
+#     - shell: find /tmp -maxdepth 1 -type f -name esx*
+#       register: esx_support_bundles
+#
+#     - fetch:
+#         src: "{{ item }}"
+#         dest: /mnt/support/{{ buildID }}/{{ item | basename }}
+#       with_items:
+#         - "{{ esx_support_bundles.stdout_lines }}"
+
+
+- name: Get Controller Logs
+  hosts: controllers
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+    - shell: storfs-support
+
+    - shell: find /var/support/ -maxdepth 1 -type f -name storfs-support*
+      register: cvm_support_bundles
+
+    - fetch:
+        src: "{{ item }}"
+        dest: /mnt/support/{{ buildID }}/{{ item | basename }}
+        flat: yes
+      with_items:
+        - "{{ cvm_support_bundles.stdout_lines }}"

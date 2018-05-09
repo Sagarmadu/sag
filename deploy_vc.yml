@@ -1,0 +1,116 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        vcsa_template_prefix: "vcsa6_u3"
+
+    - debug:
+        msg: "{{ options.vcsaVersion }}"
+    - set_fact:
+        vcsa_template_prefix: "vcsa65"
+      when: options.vcsaVersion == 65
+
+
+    - name: Set Template Name
+      set_fact:
+        vcsa_template: "{{ jsonData.deploy.vcCluster }}-{{ vcsa_template_prefix }}"
+        vcsa_name: "{{ vcsa_template_prefix }}-{{ userId }}-{{ jsonData.deploy.vmPrefix }}-{{ options.vcsaName }}"
+
+    - name: Checking if nested ESX is already deployed
+      local_action:
+        module: vmware_vm_facts
+        hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+      register: all_vms
+
+    - name: Send notification
+      slack:
+        token: T047GHA9Z/B4TV75STW/xJrMQxJkPs2UZ54tGPvo40HG
+        msg: "VCSA {{ options.vcsaName }} already exists"
+        channel: "@{{ userId }}"
+        color: "good"
+        username: 'ansiblebot'
+      delegate_to: localhost
+      when: userId is defined and vcsa_name in all_vms['virtual_machines'].keys()
+
+    - name: Get VCSA IP
+      local_action:
+        module: reserve.py
+        jsonData: "{{ jsonData }}"
+        node: "{{ vcsa_name }}"
+      when: createVCSA == true
+
+    - name: Get random ESX host
+      local_action:
+        module: gethosts.py
+        vcParameters: "{{ jsonData.deploy }}"
+
+    - name: Clone VCSA Template
+      local_action:
+        module: vsphere_guest
+        vcenter_hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+        guest: "{{ vcsa_name }}"
+        from_template: yes
+        template_src: "{{ vcsa_template }}"
+        esxi:
+          datacenter: "{{ jsonData.deploy.vcDatacenter }}"
+          hostname: "{{ deployHost }}"
+        vm_extra_config:
+          folder: "{{ jsonData.deploy.vcCluster }}-simulators"
+        power_on_after_clone: no
+      when: (vcsa_name not in all_vms['virtual_machines'].keys() and createVCSA == true) or deleteVCSA == true
+
+    - name: Set VCSA networks
+      local_action:
+        module: vsphere_guest
+        vcenter_hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        cluster: "{{ jsonData.deploy.vcCluster }}"
+        validate_certs: no
+        guest: "{{ vcsa_name }}"
+        state: reconfigured
+        vm_nic:
+          nic1:
+            type: vmxnet3
+            network: "{{ jsonData.deploy.mgmtNetwork }}"
+            network_type: "{{ jsonData.deploy.mgmtNetworkType }}"
+        esxi:
+          datacenter: "{{ jsonData.deploy.vcDatacenter }}"
+      when: (vcsa_name not in all_vms['virtual_machines'].keys() and createVCSA == true) or deleteVCSA == true
+
+    - name: Customize VCSA
+      local_action:
+        module: customizeVCSA
+        vcParameters: "{{ jsonData.deploy }}"
+        vm_name: "{{ vcsa_name }}"
+        dns: "{{ jsonData.dns }}"
+        ntp: "{{ jsonData.ntp }}"
+        netmask: "{{ jsonData.netmask.management }}"
+        gateway: "{{ jsonData.gateway.management }}"
+        ip: "{{ vcsaIp }}"
+        newVcPass: "{{ options.vcsaPassword }}"
+      when: (vcsa_name not in all_vms['virtual_machines'].keys() and createVCSA == true) or deleteVCSA == true
+
+    - name: Send notification
+      slack:
+        token: T047GHA9Z/B4TV75STW/xJrMQxJkPs2UZ54tGPvo40HG
+        msg: "Job <https://tower.tme.storvisor.com/#/jobs/{{tower_job_id}}|{{tower_job_id}}> has completed \n vCenter: <https://{{ vcsaIp }}|{{ vcsaIp }}>"
+        channel: "@{{ userId }}"
+        color: "good"
+        username: 'ansiblebot'
+      delegate_to: localhost
+      when: tower_job_id is defined and userId is defined

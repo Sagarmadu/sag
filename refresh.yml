@@ -1,0 +1,383 @@
+
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  vars:
+    ansible_ssh_user: "{{ jsonData.deploy.user }}"
+    ansible_ssh_pass: "{{ jsonData.deploy.password | b64decode }}"
+
+  tasks:
+
+    - set_fact:
+        esx_template_location: "{{ template_map[buildInfo.esx] }}"
+        vcsa_template_location: "{{ template_map[buildInfo.vcsa] }}"
+        vcsa_template_prefix: "{{ template_map[buildInfo.vcsa].split('/')[4] }}"
+        esx_template_prefix: "{{ template_map[buildInfo.esx].split('/')[4] }}"
+        controller_template_prefix: "{{ template_map[buildInfo.scvm].split('/')[4] }}"
+        replRoleType: "{{ cluster.replRoleType | default(omit, True) | lower }}"
+
+    - name: Set Template Name
+      set_fact:
+        template_name: "{{ jsonData.deploy.vcCluster }}-{{ esx_template_prefix }}"
+        vcsa_template: "{{ jsonData.deploy.vcCluster }}-{{ vcsa_template_prefix }}"
+        cvm_template: "{{ jsonData.deploy.vcCluster }}-{{ controller_template_prefix }}-controller"
+        vcsa_name: "{{ vcsa_template_prefix }}-{{ userId }}-{{ jsonData.deploy.vmPrefix }}-source"
+        buildUrl: "http://buildweb.eng.storvisor.com/master/untested-builds/latest/release"
+
+    - set_fact:
+        vcsa_name: "{{ vcsa_template_prefix }}-{{ userId }}-{{ jsonData.deploy.vmPrefix }}-target"
+      when: replRoleType is defined and replRoleType == 'target'
+
+    - name: Checking if nested ESX is already deployed
+      local_action:
+        module: vmware_vm_facts
+        hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+      register: all_vms
+
+    - name: Get Build Info
+      local_action:
+        module: getbuild.py
+        url: "{{ buildUrl }}"
+
+    - name: Get IP Information
+      local_action:
+        module: reserve.py
+        clusterInfo: "{{ cluster }}"
+        jsonData: "{{ jsonData }}"
+        release: "{{ storfsRelease }}"
+        userId: "{{ userId }}"
+
+    - set_fact:
+        vm_name: "{{ jsonData.deploy.vmPrefix }}-{{ userId }}-{{ cluster.name }}-{{ storfsRelease }}-{{ nodes.values()[0].hypervisorMgmt }}"
+
+    - name: Get Resources
+      local_action:
+        module: getresources.py
+        vcParameters: "{{ jsonData.deploy }}"
+
+    - debug:
+        msg:
+          - "CPU: {{ cpuUsage }}"
+          - "Memory: {{ memUsage }}"
+
+    - name: Send notification
+      slack:
+        token: T047GHA9Z/B4TV75STW/xJrMQxJkPs2UZ54tGPvo40HG
+        msg: "Sorry @{{ userId }}, there are not enough resources to satisfy your request."
+        channel: "@{{ userId }}"
+        color: "danger"
+        username: 'ansiblebot'
+      delegate_to: localhost
+      when: resourceUsageHigh == true and vm_name not in all_vms['virtual_machines'].keys()
+      run_once: true
+
+    - fail:
+        msg: "Not enough resources to create any more clusters"
+      when: resourceUsageHigh == true and vm_name not in all_vms['virtual_machines'].keys()
+
+    # - name: Get VCSA IP
+    #   set_fact:
+    #     vcsaIp: "{{ all_vms['virtual_machines'][vcsa_name ]['ip_address'] }}"
+    #   when: vcsa_name in all_vms['virtual_machines'].keys()
+    #
+    - name: Get VCSA IP
+      local_action:
+        module: reserve.py
+        jsonData: "{{ jsonData }}"
+        node: "{{ vcsa_name }}"
+      when: createVCSA == true and vcsaIp is not defined
+    #
+    - name: extract esx host info
+      add_host: name={{ item.hypervisorMgmt }} group=esx
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esxip={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                scvmdataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: extract controller info
+      add_host: name={{ item.controllerMgmt }} group=controllers
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esx_host={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                dataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+                replip={{ item.controllerRepl }}
+                replcip={{ item.replcip }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: extract cluster info
+      add_host: name={{ item.mgmtcip }} group=clusters
+                ansible_user={{ jsonData.deploy.user }}
+                ansible_ssh_pass={{ jsonData.esx.password | b64decode }}
+                ansible_pass={{ jsonData.esx.password | b64decode }}
+                esx_host={{ item.hypervisorMgmt }}
+                scvmip={{ item.controllerMgmt }}
+                hypervisorip={{ item.hypervisorData }}
+                dataip={{ item.controllerData }}
+                clusterName={{ item.clusterName }}
+                datacenter={{ item.datacenter }}
+                mgmtcip={{ item.mgmtcip }}
+                datacip={{ item.datacip }}
+                nodecount={{ item.nodecount }}
+                storfsBuild={{ storfsBuild }}
+                storfsRelease={{ storfsRelease }}
+                package={{ package }}
+                vcsaIp={{ vcsaIp | default(jsonData.vcenter.host) }}
+      with_items:
+          - "{{ nodes.values() }}"
+
+    - name: Set MTU to 1500
+      ini_file:
+        dest: /opt/springpath/springpath_default.tunes
+        section: networking
+        option: mtu_data
+        value: 1500
+
+    - name: Get random ESX host
+      local_action:
+        module: gethosts.py
+        vcParameters: "{{ jsonData.deploy }}"
+      when: template_name not in all_vms['virtual_machines'].keys()
+
+    - name: Deploy ESX template from OVA
+      local_action:
+        module: deployOva
+        datastore: "{{ jsonData.deploy.datastore }}"
+        network: "Storage Controller Management Network"
+        name: "{{ template_name }}"
+        ovalocation: "{{ esx_template_location }}"
+        esxUserName: "{{ jsonData.deploy.user }}"
+        esxPassword: "{{ jsonData.deploy.password }}"
+        hostname: "{{ deployHost }}"
+        modelNumber: "simulator"
+      when: template_name not in all_vms['virtual_machines'].keys()
+
+    - name: Get random ESX host
+      local_action:
+        module: gethosts.py
+        vcParameters: "{{ jsonData.deploy }}"
+
+    - name: Add resource pool to vCenter
+      local_action:
+        module: vmware_resource_pool
+        hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        datacenter: "{{ jsonData.deploy.vcDatacenter }}"
+        cluster: "{{ jsonData.deploy.vcCluster }}"
+        resource_pool: "{{ jsonData.deploy.vcCluster }}-{{ userId }}"
+        mem_shares: normal
+        mem_limit: 65456
+        mem_reservation: 8192
+        mem_expandable_reservations: True
+        cpu_shares: normal
+        cpu_limit: 10000
+        cpu_reservation: 1024
+        cpu_expandable_reservations: True
+        state: present
+        validate_certs: no
+
+    # - name: Deploy VCSA template from OVA
+    #   local_action:
+    #     module: deployOva
+    #     datastore: "{{ jsonData.deploy.datastore }}"
+    #     network: "Storage Controller Management Network"
+    #     name: "{{ vcsa_template }}"
+    #     ovalocation: "{{ vcsa_template_location }}"
+    #     esxUserName: "{{ jsonData.deploy.user }}"
+    #     esxPassword: "{{ jsonData.deploy.password }}"
+    #     hostname: "{{ deployHost }}"
+    #     modelNumber: "simulator"
+    #   when: vcsa_template not in all_vms['virtual_machines'].keys() and createVCSA == true
+    #
+    # - name: Delete VCSA
+    #   local_action:
+    #     module: vsphere_guest
+    #     vcenter_hostname: "{{ jsonData.deploy.vcHost }}"
+    #     username: "{{ jsonData.deploy.vcUser }}"
+    #     password: "{{ jsonData.deploy.vcPass }}"
+    #     validate_certs: no
+    #     guest: "{{ vcsa_name }}"
+    #     state: absent
+    #     force: yes
+    #   when: deleteVCSA == true
+    #
+    #
+    - name: Clone VCSA Template
+      local_action:
+        module: vsphere_guest
+        vcenter_hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+        guest: "{{ vcsa_name }}"
+        from_template: yes
+        template_src: "{{ vcsa_template }}"
+        cluster: "{{ jsonData.deploy.vcCluster }}"
+        resource_pool: "/Resources/{{ jsonData.deploy.vcCluster }}-{{ userId }}"
+        vm_extra_config:
+          folder: "{{ jsonData.deploy.vcCluster }}-simulators"
+        power_on_after_clone: no
+      when: deleteVCSA == true
+
+    - name: Set VCSA networks
+      local_action:
+        module: vsphere_guest
+        vcenter_hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        cluster: "{{ jsonData.deploy.vcCluster }}"
+        validate_certs: no
+        guest: "{{ vcsa_name }}"
+        state: reconfigured
+        vm_nic:
+          nic1:
+            type: vmxnet3
+            network: "{{ jsonData.deploy.mgmtNetwork }}"
+            network_type: "{{ jsonData.deploy.mgmtNetworkType }}"
+        esxi:
+          datacenter: "{{ jsonData.deploy.vcDatacenter }}"
+      when: deleteVCSA == true
+
+    - name: Customize VCSA
+      local_action:
+        module: customizeVCSA
+        vcParameters: "{{ jsonData.deploy }}"
+        vm_name: "{{ vcsa_name }}"
+        dns: "{{ jsonData.dns }}"
+        ntp: "{{ jsonData.ntp }}"
+        netmask: "{{ jsonData.netmask.management }}"
+        gateway: "{{ jsonData.gateway.management }}"
+        ip: "{{ vcsaIp }}"
+        newVcPass: "{{ jsonData.vcenter.password }}"
+      when: deleteVCSA == true
+
+    - pause: seconds=20
+
+    - name: Power off VM
+      local_action:
+        module: vmware_guest
+        hostname: "{{ jsonData.deploy.vcHost }}"
+        username: "{{ jsonData.deploy.vcUser }}"
+        password: "{{ jsonData.deploy.vcPass }}"
+        validate_certs: no
+        cluster: "{{ jsonData.deploy.vcCluster }}"
+        datacenter: "{{ jsonData.deploy.vcDatacenter }}"
+        folder: "/{{ jsonData.deploy.vcDatacenter }}/vm/{{ jsonData.deploy.vcCluster }}-simulators"
+        name: "{{ vcsa_name }}"
+        state: poweredoff
+
+
+- name: Deploy ESX Template
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+    - include: tasks/esx.yml
+
+- name: Install Packages
+  hosts: controllers
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+
+    - set_fact:
+        node_ips: "{{ groups['esx'] | join(' ') }}"
+        vm_name: "stCtlVM-{{ inventory_hostname }}"
+        storfsRelease: "{{ hostvars[inventory_hostname]['storfsRelease'] }}"
+        storfsBuild: "{{ hostvars[inventory_hostname]['storfsBuild'] }}"
+        package: "{{ hostvars[inventory_hostname]['package'] }}"
+        buildUrl: "{{ options.build | default(buildInfo.build, True) | regex_replace('latest', storfsBuild) }}"
+
+    - name: Waiting for Controller to Restart
+      local_action:
+         module: wait_for
+             host={{ inventory_hostname }}
+             port=22
+             state=started
+             delay=10
+             timeout=1800
+
+    - name: Initializing Storage Controller VM for Installation
+      shell: mount -t tmpfs -o size=4g tmpfs /tmp
+
+    - debug:
+        msg: "Release: {{ storfsRelease }} Build: {{ storfsBuild }}"
+
+    - stat: path="/etc/stvboot.cfg"
+      register: stvboot
+
+    - name: Extract Deploy Packages
+      get_url:
+        url: "http://10.198.0.5/springpath/deb/storfs-appliance.deb"
+        dest: /tmp
+      when: not stvboot.stat.exists|bool or stvboot.stat.size == 0
+
+    - name: Installing Preliminary Packages
+      shell: find /tmp -name storfs-appliance*.deb | xargs dpkg -i
+      when: not stvboot.stat.exists|bool or stvboot.stat.size == 0
+
+    # - name: Installing Preliminary Packages
+    #   shell: find /tmp -name storfs-fw*.deb | xargs dpkg -i
+    #   when: not stvboot.stat.exists|bool or stvboot.stat.size == 0
+
+    - name: Create bootdev
+      shell: /usr/share/springpath/storfs-appliance/config-bootdev.sh -r -y; poweroff
+      when: not stvboot.stat.exists|bool or stvboot.stat.size == 0
+
+- name: Deploy ESX Template
+  hosts: esx
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+  serial: 8
+
+  tasks:
+
+    - name: Reset license
+      shell: "cp -f /etc/vmware/.#license.cfg /etc/vmware/license.cfg"
+
+    - name: Backup config
+      shell: /sbin/auto-backup.sh
+
+    - shell: poweroff
+      async: 0
+      poll: 0

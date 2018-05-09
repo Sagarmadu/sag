@@ -1,0 +1,68 @@
+#!/usr/bin/env ansible-playbook
+---
+- name: Initializing Configuration
+  hosts: localhost
+  connection: local
+  become: false
+  gather_facts: no
+  any_errors_fatal: true
+
+  tasks:
+
+    - set_fact:
+        pairingInfo: "{{ lookup('file', '/opt/sysmgmt/testbeds/sandbox/pair.yml') | from_yaml }}"
+
+    - local_action:
+        module: copy
+        src: /opt/sysmgmt/testbeds/sandbox/{{ buildVM }}_testbed.conf
+        dest: /opt/git/cypress
+        force: yes
+        remote_src: True
+
+    - file:
+        path: /tmp/stDataSvcMgrTest.log
+        state: absent
+
+    - set_fact:
+        scriptOutput: JAVA_HOME=/usr/lib/jvm/java-1.7.0-openjdk-amd64 GRADLE_USER_HOME=/opt/git/cypress/build/.gradle SRCDIR=/opt/git/cypress/ OBJDIR=/opt/git/cypress/build/release/ ../build-gradle.sh -Dorg.gradle.daemon=false --stacktrace test -Dcom.springpath.sysmgmt.testInternal.testConf={{ buildVM }}_testbed.conf -Dcom.springpath.sysmgmt.testInternal.primary.mgmtIp={{ pairingInfo[buildVM].srcMgmtIp }} -Dcom.springpath.sysmgmt.testInternal.primary.ctlvmPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.primary.vcIp={{ pairingInfo[buildVM].srcVC }} -Dcom.springpath.sysmgmt.testInternal.primary.vcPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.primary.dcName={{ pairingInfo[buildVM].srcDC }}  -Dcom.springpath.sysmgmt.testInternal.primary.clName={{ pairingInfo[buildVM].srcCluster }} -Dcom.springpath.sysmgmt.testInternal.secondary.mgmtIp={{ pairingInfo[buildVM].destMgmtIp }} -Dcom.springpath.sysmgmt.testInternal.secondary.ctlvmPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.secondary.vcIp={{ pairingInfo[buildVM].tgtVC }}  -Dcom.springpath.sysmgmt.testInternal.secondary.vcPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.secondary.dcName={{ pairingInfo[buildVM].tgtDC }} -Dcom.springpath.sysmgmt.testInternal.secondary.clName={{ pairingInfo[buildVM].tgtCluster }} -Dhttp.proxyHost=proxy.esl.cisco.com -Dhttp.proxyPort=8080 -Dhttps.proxyHost=proxy.esl.cisco.com -Dhttps.proxyPort=8080 -Dhttp.nonProxyHosts='*.storvisor.com|*.cisco.com' --tests com.storvisor.sysmgmt.stDataSvcMgr.StDataSvcMgrIntegrationTests
+
+    - local_action:
+        module: copy
+        content: "{{ scriptOutput }}"
+        dest: /opt/git/cypress/src/sysmgmt/stDataSvcMgr/run_datasvcmgr.sh
+        force: yes
+        remote_src: true
+        mode: "u=rwx,g=r,o=r"
+
+    - set_fact:
+        scriptOutput: JAVA_HOME=/usr/lib/jvm/java-1.7.0-openjdk-amd64 GRADLE_USER_HOME=/opt/git/cypress/build/.gradle SRCDIR=/opt/git/cypress/ OBJDIR=/opt/git/cypress/build/release/ ../build-gradle.sh -Dorg.gradle.daemon=false --stacktrace test -Dcom.springpath.sysmgmt.testInternal.testConf={{ buildVM }}_testbed.conf -Dcom.springpath.sysmgmt.testInternal.primary.mgmtIp={{ pairingInfo[buildVM].srcMgmtIp }} -Dcom.springpath.sysmgmt.testInternal.primary.ctlvmPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.primary.vcIp={{ pairingInfo[buildVM].srcVC }} -Dcom.springpath.sysmgmt.testInternal.primary.vcPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.primary.dcName={{ pairingInfo[buildVM].srcDC }}  -Dcom.springpath.sysmgmt.testInternal.primary.clName={{ pairingInfo[buildVM].srcCluster }} -Dcom.springpath.sysmgmt.testInternal.secondary.mgmtIp={{ pairingInfo[buildVM].destMgmtIp }} -Dcom.springpath.sysmgmt.testInternal.secondary.ctlvmPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.secondary.vcIp={{ pairingInfo[buildVM].tgtVC }}  -Dcom.springpath.sysmgmt.testInternal.secondary.vcPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.secondary.dcName={{ pairingInfo[buildVM].tgtDC }} -Dcom.springpath.sysmgmt.testInternal.secondary.clName={{ pairingInfo[buildVM].tgtCluster }} -Dhttp.proxyHost=proxy.esl.cisco.com -Dhttp.proxyPort=8080 -Dhttps.proxyHost=proxy.esl.cisco.com -Dhttps.proxyPort=8080 -Dhttp.nonProxyHosts='*.storvisor.com|*.cisco.com' --tests com.storvisor.sysmgmt.stDataSvcMgr.StHypervisorSvcTest --rerun-tasks
+
+    - local_action:
+        module: copy
+        content: "{{ scriptOutput }}"
+        dest: /opt/git/cypress/src/sysmgmt/stDataSvcMgr/run_hypervisorsvc.sh
+        force: yes
+        remote_src: true
+        mode: "u=rwx,g=r,o=r"
+
+    - set_fact:
+        scriptOutput: JAVA_HOME=/usr/lib/jvm/java-1.7.0-openjdk-amd64 GRADLE_USER_HOME=/opt/git/cypress/build/.gradle SRCDIR=/opt/git/cypress/ OBJDIR=/opt/git/cypress/build/release/ ../build-gradle.sh -Dorg.gradle.daemon=false --stacktrace test -Dcom.springpath.sysmgmt.testInternal.testConf={{ buildVM }}_testbed.conf -Dcom.springpath.sysmgmt.testInternal.primary.mgmtIp={{ pairingInfo[buildVM].srcMgmtIp }} -Dcom.springpath.sysmgmt.testInternal.primary.ctlvmPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.primary.vcIp={{ pairingInfo[buildVM].srcVC }} -Dcom.springpath.sysmgmt.testInternal.primary.vcPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.primary.dcName={{ pairingInfo[buildVM].srcDC }}  -Dcom.springpath.sysmgmt.testInternal.primary.clName={{ pairingInfo[buildVM].srcCluster }} -Dcom.springpath.sysmgmt.testInternal.secondary.mgmtIp={{ pairingInfo[buildVM].destMgmtIp }} -Dcom.springpath.sysmgmt.testInternal.secondary.ctlvmPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.secondary.vcIp={{ pairingInfo[buildVM].tgtVC }}  -Dcom.springpath.sysmgmt.testInternal.secondary.vcPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.secondary.dcName={{ pairingInfo[buildVM].tgtDC }} -Dcom.springpath.sysmgmt.testInternal.secondary.clName={{ pairingInfo[buildVM].tgtCluster }} -Dhttp.proxyHost=proxy.esl.cisco.com -Dhttp.proxyPort=8080 -Dhttps.proxyHost=proxy.esl.cisco.com -Dhttps.proxyPort=8080 -Dhttp.nonProxyHosts='*.storvisor.com|*.cisco.com' --tests com.storvisor.sysmgmt.stDataSvcMgr.StDataSvcMgrImplTest.testPairUnpairWorkflow1 --rerun-tasks
+
+    - local_action:
+        module: copy
+        content: "{{ scriptOutput }}"
+        dest: /opt/git/cypress/src/sysmgmt/stDataSvcMgr/run_pair1.sh
+        force: yes
+        remote_src: true
+        mode: "u=rwx,g=r,o=r"
+
+    - set_fact:
+        scriptOutput: JAVA_HOME=/usr/lib/jvm/java-1.7.0-openjdk-amd64 GRADLE_USER_HOME=/opt/git/cypress/build/.gradle SRCDIR=/opt/git/cypress/ OBJDIR=/opt/git/cypress/build/release/ ../build-gradle.sh -Dorg.gradle.daemon=false --stacktrace test -Dcom.springpath.sysmgmt.testInternal.testConf={{ buildVM }}_testbed.conf -Dcom.springpath.sysmgmt.testInternal.primary.mgmtIp={{ pairingInfo[buildVM].srcMgmtIp }} -Dcom.springpath.sysmgmt.testInternal.primary.ctlvmPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.primary.vcIp={{ pairingInfo[buildVM].srcVC }} -Dcom.springpath.sysmgmt.testInternal.primary.vcPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.primary.dcName={{ pairingInfo[buildVM].srcDC }}  -Dcom.springpath.sysmgmt.testInternal.primary.clName={{ pairingInfo[buildVM].srcCluster }} -Dcom.springpath.sysmgmt.testInternal.secondary.mgmtIp={{ pairingInfo[buildVM].destMgmtIp }} -Dcom.springpath.sysmgmt.testInternal.secondary.ctlvmPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.secondary.vcIp={{ pairingInfo[buildVM].tgtVC }}  -Dcom.springpath.sysmgmt.testInternal.secondary.vcPwd=Cisco123 -Dcom.springpath.sysmgmt.testInternal.secondary.dcName={{ pairingInfo[buildVM].tgtDC }} -Dcom.springpath.sysmgmt.testInternal.secondary.clName={{ pairingInfo[buildVM].tgtCluster }} -Dhttp.proxyHost=proxy.esl.cisco.com -Dhttp.proxyPort=8080 -Dhttps.proxyHost=proxy.esl.cisco.com -Dhttps.proxyPort=8080 -Dhttp.nonProxyHosts='*.storvisor.com|*.cisco.com' --tests com.storvisor.sysmgmt.stDataSvcMgr.StDataSvcMgrImplTest.testPairUnpairWorkflow4 --rerun-tasks
+
+    - local_action:
+        module: copy
+        content: "{{ scriptOutput }}"
+        dest: /opt/git/cypress/src/sysmgmt/stDataSvcMgr/run_pair4.sh
+        force: yes
+        remote_src: true
+        mode: "u=rwx,g=r,o=r"
